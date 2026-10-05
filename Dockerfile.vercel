@@ -6,6 +6,4 @@ COPY ./out/todo.mahc /app/todo
 
 RUN chmod +x /app/todo
 
-EXPOSE 3000
-
-CMD ["/app/todo", "--host", "0.0.0.0", "--port", "3000"]
+CMD ["/bin/sh", "-c", "/app/todo --host 0.0.0.0 --port ${PORT}"]
