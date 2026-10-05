@@ -1,0 +1,36 @@
+import "std:test"
+import web from "./web"
+
+test "the page is one html document" {
+    let page = web.page()
+    assert(page.starts_with("<!doctype html>"))
+    assert(page.contains("<html lang='en'>"))
+    assert(page.contains("</html>"))
+    assert_eq(page.split("<script>").len(), 2)
+}
+
+test "the page has somewhere to type a title and a button to add it" {
+    let page = web.page()
+    assert(page.contains("<form id='new'>"))
+    assert(page.contains("id='title'"))
+    assert(page.contains("<ul id='list'></ul>"))
+}
+
+test "the page talks to the json api over fetch" {
+    let page = web.page()
+    assert(page.contains("fetch("))
+    for let call in [
+        "call('POST', '/todos'",
+        "call('GET', '/todos'",
+        "call('PATCH', '/todos/'",
+        "call('DELETE', '/todos/'"
+    ] {
+        assert(page.contains(call), "the page should send " + call)
+    }
+}
+
+test "the page carries no outside script or style" {
+    let page = web.page()
+    assert(!page.contains("http://") & !page.contains("https://"))
+    assert(!page.contains("<script src="))
+}

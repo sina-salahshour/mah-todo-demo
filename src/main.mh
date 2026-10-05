@@ -1,0 +1,36 @@
+# p05 -- a REST API for a todo list, written in Mah.
+#
+#   mah run                     # http://127.0.0.1:4000, or the next free port
+#   mah run -- 9000             # a bare number picks the port
+#   mah run -- --host 0.0.0.0   # and HOST/PORT in the environment are read too
+#
+# The todos live in a variable for as long as the program runs: nothing is
+# written to disk, so every run starts with an empty list.
+import process from "std:process"
+import socket from "std:socket"
+import api from "./api"
+import app from "./app"
+import store from "./store"
+
+let config = try { app.config_from_args(process.args()) } catch {
+    e: app.ConfigError => {
+        print("p05: " + e.message())
+        print(app.usage())
+        process.exit(2)
+    }
+}
+
+let server = try { app.start(config, store.Store.new()) } catch {
+    e: socket.SocketError => {
+        print("p05: cannot listen on " + config.host + ":" + config.port + ": " + e.message())
+        process.exit(1)
+    }
+}
+if server.port() != config.port {
+    print("port " + config.port + " was taken, using " + server.port() + " instead")
+}
+print("todo api on " + server.url() + " -- Ctrl-C to stop")
+for let route in server.router.describe() {
+    print("  " + route)
+}
+app.serve(server)

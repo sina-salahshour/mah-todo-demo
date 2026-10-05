@@ -1,0 +1,176 @@
+# The todo API: every route the server answers, JSON in and JSON out. The
+# routes are built here, the connection handling is src/app.mh's job, and the
+# todos live in a store.Store this module is handed.
+import json from "std:json"
+import http from "./http"
+import store from "./store"
+import web from "./web"
+
+## The body POST /todos and PUT /todos/{id} take: a title, and a done flag that
+## defaults to false when it isn't there.
+struct NewTodo { title: String, done: Option<Bool> }
+
+## The body PATCH /todos/{id} takes: whichever of the two fields are there.
+struct TodoPatch { title: Option<String>, done: Option<Bool> }
+
+## The answer to GET /todos: how many came back, and which.
+struct TodoList { count: Number, todos: Vector<store.Todo> }
+
+## The answer to GET /api: what this is, how much is in it, and where to go.
+struct Index { service: String, todos: Number, routes: Vector<String> }
+
+## The answer to GET /health.
+struct Health { status: String, todos: Number }
+
+## `some(true)` or `some(false)` for a `?done=...`, none when the query doesn't
+## ask for one. Throws HttpError on any other value.
+fn done_filter(query: Map<String, String>) throws http.HttpError {
+    if !query.has("done") { return none }
+    let raw = query["done"]
+    if raw == "true" { return some(true) }
+    if raw == "false" { return some(false) }
+    throw http.HttpError.BadRequest { message: "?done= takes true or false, not " + raw }
+}
+
+## The `{id}` of a path as a Number; throws HttpError when it isn't one.
+fn require_id(params: Map<String, String>) throws http.HttpError {
+    let raw = if params.has("id") { params["id"] } else { "" }
+    let id = raw.parse_number()
+    if id == none {
+        throw http.HttpError.BadRequest {
+            message: "the id in the path must be a number, not " + raw
+        }
+    }
+    id
+}
+
+## What a 404 for a todo that isn't there says.
+fn missing(id: Number) -> http.Response {
+    http.Response.error(404, "not_found", "there is no todo " + id)
+}
+
+## The trimmed title of a `NewTodo`, or a 422 when it is only whitespace.
+fn checked_title(input: NewTodo) -> Option<String> {
+    let title = input.title.trim()
+    if title == "" { return none }
+    some(title)
+}
+
+## The routes of the todo API, all reading and writing `db`.
+export fn build(db: store.Store) -> http.Router {
+    let router = http.Router.new()
+
+    # The page for a browser. Everything it does goes through the routes below,
+    # so there is one API, not two.
+    router.get("/", fn(req: http.Request, params: Map<String, String>) -> http.Response {
+        http.Response.html(web.page())
+    })
+
+    router.get("/api", fn(req: http.Request, params: Map<String, String>) -> http.Response {
+        http.Response.json(
+            Index { service: "todo api", todos: db.len(), routes: router.describe() }
+        )
+    })
+
+    router.get("/health", fn(req: http.Request, params: Map<String, String>) -> http.Response {
+        http.Response.json(Health { status: "ok", todos: db.len() })
+    })
+
+    router.get("/todos", fn(req: http.Request, params: Map<String, String>) -> http.Response {
+        let done = try { done_filter(req.query) } catch {
+            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        let todos = db.all(done)
+        http.Response.json(TodoList { count: todos.len(), todos: todos })
+    })
+
+    router.post("/todos", fn(req: http.Request, params: Map<String, String>) -> http.Response {
+        if req.body.trim() == "" {
+            return http.Response.error(400, "bad_request", "a JSON body is required")
+        }
+        let input = try { json.parse_as(NewTodo, req.body) } catch {
+            e: json.JsonError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        let title = checked_title(input)
+        if title == none {
+            return http.Response.error(422, "invalid_todo", "title must not be empty")
+        }
+        let todo = db.add(title.unwrap_or(""), input.done.unwrap_or(false))
+        let res = http.Response.json(todo, 201)
+        res.headers["location"] = "/todos/" + todo.id
+        res
+    })
+
+    router.get("/todos/{id}", fn(req: http.Request, params: Map<String, String>) -> http.Response {
+        let id = try { require_id(params) } catch {
+            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        let todo = db.get(id)
+        if todo == none { return missing(id) }
+        http.Response.json(todo.unwrap())
+    })
+
+    router.put("/todos/{id}", fn(req: http.Request, params: Map<String, String>) -> http.Response {
+        let id = try { require_id(params) } catch {
+            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        let input = try { json.parse_as(NewTodo, req.body) } catch {
+            e: json.JsonError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        let title = checked_title(input)
+        if title == none {
+            return http.Response.error(422, "invalid_todo", "title must not be empty")
+        }
+        let todo = db.replace(id, title.unwrap_or(""), input.done.unwrap_or(false))
+        if todo == none { return missing(id) }
+        http.Response.json(todo)
+    })
+
+    router.patch("/todos/{id}", fn(
+        req: http.Request,
+        params: Map<String, String>
+    ) -> http.Response {
+        let id = try { require_id(params) } catch {
+            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        let input = try { json.parse_as(TodoPatch, req.body) } catch {
+            e: json.JsonError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        if input.title == none & input.done == none {
+            return http.Response.error(422, "invalid_patch", "give a title, a done flag, or both")
+        }
+        let todo = db.get(id)
+        if todo == none { return missing(id) }
+        let one = todo.unwrap()
+        let title = if input.title == none { one.title } else { input.title.unwrap_or("").trim() }
+        let done = if input.done == none { one.done } else { input.done.unwrap_or(false) }
+        let updated = db.replace(id, title, done)
+        if updated == none { return missing(id) }
+        http.Response.json(updated.unwrap())
+    })
+
+    router.post("/todos/{id}/toggle", fn(
+        req: http.Request,
+        params: Map<String, String>
+    ) -> http.Response {
+        let id = try { require_id(params) } catch {
+            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        let todo = db.toggle(id)
+        if todo == none { return missing(id) }
+        http.Response.json(todo)
+    })
+
+    router.delete("/todos/{id}", fn(
+        req: http.Request,
+        params: Map<String, String>
+    ) -> http.Response {
+        let id = try { require_id(params) } catch {
+            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
+        }
+        if !db.remove(id) { return missing(id) }
+        http.Response.empty(204)
+    })
+
+    router
+}

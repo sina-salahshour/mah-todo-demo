@@ -1,0 +1,94 @@
+# The todo list itself, held in memory for as long as the program runs.
+# Nothing is written to disk, so every run starts empty.
+import time from "std:time"
+
+## One todo, exactly as the API hands it out.
+export struct Todo { id: Number, title: String, done: Bool, created_at: String }
+
+## The todos, oldest first, with the id to give the next one.
+export struct Store { todos: Vector<Todo>, next_id: Number }
+
+## Where `id` sits in `items`, or none when there is no such todo.
+fn index_of(items: Vector<Todo>, id: Number) -> Option<Number> {
+    for let i in 0..items.len() {
+        if items[i].id == id { return some(i) }
+    }
+    none
+}
+
+## `items` without the one at `index` (Vectors have no remove of their own).
+fn without_at(items: Vector<Todo>, index: Number) -> Vector<Todo> {
+    let kept = []
+    for let i in 0..items.len() {
+        if i != index { kept.push(items[i]) }
+    }
+    kept
+}
+
+impl Store {
+    fn new() -> Store { Store { todos: [], next_id: 1 } }
+
+    ## How many todos there are.
+    fn len(self) -> Number { self.todos.len() }
+
+    ## Every todo, oldest first; `some(done)` leaves only the finished or only
+    ## the open ones, and `none` (the default) leaves all of them.
+    fn all(self, done: Option<Bool> = none) -> Vector<Todo> {
+        if done == none { return self.todos }
+        self.todos.filter(fn(todo) { todo.done == done.unwrap_or(false) }).reduce()
+    }
+
+    ## The todo with `id`, or none.
+    fn get(self, id: Number) -> Option<Todo> {
+        let at = index_of(self.todos, id)
+        if at == none { return none }
+        some(self.todos[at.unwrap()])
+    }
+
+    ## Whether there is a todo with `id`.
+    fn has(self, id: Number) -> Bool { index_of(self.todos, id) != none }
+
+    ## Adds a todo and returns it, with the next free id.
+    fn add(self, title: String, done: Bool = false) -> Todo {
+        let todo = Todo {
+            id: self.next_id,
+            title: title,
+            done: done,
+            created_at: time.iso(time.utc(time.now()))
+        }
+        self.next_id = self.next_id + 1
+        self.todos.push(todo)
+        todo
+    }
+
+    ## Puts a whole new todo in place of the one with `id` -- the REST `PUT`:
+    ## title and done both come from the request. none when there's no such id.
+    fn replace(self, id: Number, title: String, done: Bool) -> Option<Todo> {
+        let at = index_of(self.todos, id)
+        if at == none { return none }
+        let todo = self.todos[at.unwrap()]
+        todo.title = title
+        todo.done = done
+        some(todo)
+    }
+
+    ## Flips `done`, for POST /todos/{id}/toggle. none when there's no such id.
+    fn toggle(self, id: Number) -> Option<Todo> {
+        let at = index_of(self.todos, id)
+        if at == none { return none }
+        let todo = self.todos[at.unwrap()]
+        todo.done = !todo.done
+        some(todo)
+    }
+
+    ## Drops the todo with `id`; whether it was there to begin with.
+    fn remove(self, id: Number) -> Bool {
+        let at = index_of(self.todos, id)
+        if at == none { return false }
+        self.todos = without_at(self.todos, at.unwrap())
+        true
+    }
+
+    ## Forgets every todo (the ids carry on where they left off).
+    fn clear(self) { self.todos = [] }
+}

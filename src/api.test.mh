@@ -1,0 +1,186 @@
+import "std:test"
+import json from "std:json"
+import "./api"
+import "./http"
+import "./store"
+
+## The API over a fresh list of todos.
+struct Fixture { db: Store, router: Router }
+
+fn fixture() -> Fixture {
+    let db = Store.new()
+    Fixture { db: db, router: build(db) }
+}
+
+## The `?a=1&b=2` of a request target, as a map.
+fn query_of(target: String) -> Map<String, String> {
+    let out = [:]
+    let at = target.index_of("?")
+    if at == none { return out }
+    for let pair in target[(at.unwrap() + 1)..].split("&") {
+        if pair == "" { continue }
+        let eq = pair.index_of("=")
+        if eq == none {
+            out[pair] = ""
+        } else {
+            out[pair[..eq.unwrap()]] = pair[(eq.unwrap() + 1)..]
+        }
+    }
+    out
+}
+
+## Asks `router` for `target` and gives back the response, the way the wire
+## would: the path without the query, the query in a map of its own.
+fn ask(fx: Fixture, method: String, target: String, body: String = "") -> Response {
+    let at = target.index_of("?")
+    let headers = [:]
+    if body != "" { headers["content-length"] = body.len().to_string() }
+    fx.router.dispatch(Request {
+        method: method.to_upper(),
+        path: if at == none { target } else { target[..at.unwrap()] },
+        query: query_of(target),
+        headers: headers,
+        body: body
+    })
+}
+
+## The todo a JSON response carries, as the fields worth checking.
+struct Parsed { id: Number, title: String, done: Bool }
+
+fn todo_of(res: Response) -> Parsed {
+    let todo = json.parse_as(Parsed, res.body)
+    Parsed { id: todo.id, title: todo.title, done: todo.done }
+}
+
+test "the root is the page, and /api describes the service" {
+    let fx = fixture()
+    let page = ask(fx, "GET", "/")
+    assert_eq(page.status, 200)
+    assert_eq(page.headers["content-type"], "text/html; charset=utf-8")
+    assert(page.body.starts_with("<!doctype html>"))
+
+    let index = ask(fx, "GET", "/api")
+    assert_eq(index.headers["content-type"], "application/json; charset=utf-8")
+    assert(index.body.contains("\"service\":\"todo api\""))
+    assert(index.body.contains("GET /todos/{id}"))
+}
+
+test "health counts what is in the list" {
+    let fx = fixture()
+    fx.db.add("wash up")
+    let res = ask(fx, "GET", "/health")
+    assert_eq(res.status, 200)
+    assert_eq(res.body, "{\"status\":\"ok\",\"todos\":1}")
+}
+
+test "a new todo comes back with 201 and a location" {
+    let fx = fixture()
+    let res = ask(fx, "POST", "/todos", "{\"title\":\"wash up\"}")
+    assert_eq(res.status, 201)
+    assert_eq(res.headers["location"], "/todos/1")
+    let todo = todo_of(res)
+    assert_eq(todo.id, 1)
+    assert_eq(todo.title, "wash up")
+    assert_eq(todo.done, false)
+    assert_eq(fx.db.len(), 1)
+}
+
+test "a new todo may arrive already done" {
+    let fx = fixture()
+    assert_eq(todo_of(ask(fx, "POST", "/todos", "{\"title\":\"x\",\"done\":true}")).done, true)
+}
+
+test "a title is trimmed, and a blank one is refused" {
+    let fx = fixture()
+    assert_eq(todo_of(ask(fx, "POST", "/todos", "{\"title\":\"  wash up  \"}")).title, "wash up")
+    let blank = ask(fx, "POST", "/todos", "{\"title\":\"   \"}")
+    assert_eq(blank.status, 422)
+    assert(blank.body.contains("invalid_todo"))
+}
+
+test "a new todo needs a body and json" {
+    let fx = fixture()
+    assert_eq(ask(fx, "POST", "/todos").status, 400)
+    assert_eq(ask(fx, "POST", "/todos", "not json").status, 400)
+}
+
+test "listing gives the count and every todo" {
+    let fx = fixture()
+    fx.db.add("one")
+    fx.db.add("two", true)
+    let all = ask(fx, "GET", "/todos")
+    assert_eq(all.status, 200)
+    assert(all.body.contains("\"count\":2"))
+
+    let open = ask(fx, "GET", "/todos?done=false")
+    assert(open.body.contains("\"count\":1"))
+    assert(open.body.contains("one"))
+    assert(!open.body.contains("two"))
+    assert_eq(ask(fx, "GET", "/todos?done=maybe").status, 400)
+}
+
+test "one todo by id, or a 404" {
+    let fx = fixture()
+    fx.db.add("one")
+    assert_eq(todo_of(ask(fx, "GET", "/todos/1")).title, "one")
+    let missing = ask(fx, "GET", "/todos/2")
+    assert_eq(missing.status, 404)
+    assert(missing.body.contains("there is no todo 2"))
+}
+
+test "an id that is not a number is a bad request" {
+    let fx = fixture()
+    let res = ask(fx, "GET", "/todos/abc")
+    assert_eq(res.status, 400)
+    assert(res.body.contains("must be a number"))
+}
+
+test "put replaces both fields" {
+    let fx = fixture()
+    fx.db.add("one")
+    let res = ask(fx, "PUT", "/todos/1", "{\"title\":\"two\",\"done\":true}")
+    assert_eq(res.status, 200)
+    assert_eq(todo_of(res).title, "two")
+    assert_eq(todo_of(ask(fx, "GET", "/todos/1")).done, true)
+    assert_eq(ask(fx, "PUT", "/todos/9", "{\"title\":\"x\"}").status, 404)
+}
+
+test "patch changes only what it is given" {
+    let fx = fixture()
+    fx.db.add("one")
+    let titled = ask(fx, "PATCH", "/todos/1", "{\"title\":\"renamed\"}")
+    assert_eq(todo_of(titled).title, "renamed")
+    assert_eq(todo_of(titled).done, false)
+    let done = ask(fx, "PATCH", "/todos/1", "{\"done\":true}")
+    assert_eq(todo_of(done).title, "renamed")
+    assert_eq(todo_of(done).done, true)
+    assert_eq(ask(fx, "PATCH", "/todos/1", "{}").status, 422)
+    assert_eq(ask(fx, "PATCH", "/todos/9", "{\"done\":true}").status, 404)
+}
+
+test "toggle flips done and nothing else" {
+    let fx = fixture()
+    fx.db.add("one")
+    let first = ask(fx, "POST", "/todos/1/toggle")
+    assert_eq(todo_of(first).done, true)
+    assert_eq(todo_of(first).title, "one")
+    assert_eq(todo_of(ask(fx, "POST", "/todos/1/toggle")).done, false)
+    assert_eq(ask(fx, "POST", "/todos/9/toggle").status, 404)
+}
+
+test "delete answers 204 and the todo is gone" {
+    let fx = fixture()
+    fx.db.add("one")
+    let res = ask(fx, "DELETE", "/todos/1")
+    assert_eq(res.status, 204)
+    assert_eq(res.body, "")
+    assert_eq(fx.db.len(), 0)
+    assert_eq(ask(fx, "DELETE", "/todos/1").status, 404)
+}
+
+test "the wrong method on a real path is a 405" {
+    let fx = fixture()
+    let res = ask(fx, "DELETE", "/todos")
+    assert_eq(res.status, 405)
+    assert_eq(res.headers["allow"], "GET, POST")
+}

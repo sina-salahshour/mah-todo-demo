@@ -1,0 +1,81 @@
+import "std:test"
+import "./store"
+
+test "an empty store has nothing in it" {
+    let db = Store.new()
+    assert_eq(db.len(), 0)
+    assert_eq(db.next_id, 1)
+    assert_eq(db.all().len(), 0)
+}
+
+test "added todos get ids in order and keep what they were given" {
+    let db = Store.new()
+    let first = db.add("wash up")
+    let second = db.add("feed the cat", true)
+    assert_eq(first.id, 1)
+    assert_eq(first.title, "wash up")
+    assert_eq(first.done, false)
+    assert_eq(second.id, 2)
+    assert_eq(second.done, true)
+    assert_eq(db.len(), 2)
+    assert(first.created_at.ends_with("Z"), "created_at should be an ISO timestamp")
+}
+
+test "get finds a todo by id and misses without one" {
+    let db = Store.new()
+    db.add("wash up")
+    assert_eq(db.get(1).unwrap().title, "wash up")
+    assert_eq(db.get(2), none)
+    assert(db.has(1))
+    assert(!db.has(2))
+}
+
+test "all leaves everything alone unless a done filter is given" {
+    let db = Store.new()
+    db.add("one")
+    db.add("two", true)
+    db.add("three")
+    assert_eq(db.all().len(), 3)
+    let open = db.all(some(false))
+    let done = db.all(some(true))
+    assert_eq(open.len(), 2)
+    assert_eq(done.len(), 1)
+    assert_eq(done[0].title, "two")
+}
+
+test "replace swaps both fields of an existing todo" {
+    let db = Store.new()
+    db.add("wash up")
+    let changed = db.replace(1, "wash the dishes", true)
+    assert_eq(changed.unwrap().title, "wash the dishes")
+    assert_eq(changed.unwrap().done, true)
+    assert_eq(db.get(1).unwrap().title, "wash the dishes")
+    assert_eq(db.replace(9, "nothing", false), none)
+}
+
+test "toggle flips done both ways" {
+    let db = Store.new()
+    db.add("wash up")
+    assert_eq(db.toggle(1).unwrap().done, true)
+    assert_eq(db.toggle(1).unwrap().done, false)
+    assert_eq(db.toggle(9), none)
+}
+
+test "remove drops one todo and says whether it was there" {
+    let db = Store.new()
+    db.add("one")
+    db.add("two")
+    assert(db.remove(1))
+    assert_eq(db.len(), 1)
+    assert_eq(db.get(1), none)
+    assert_eq(db.get(2).unwrap().title, "two")
+    assert(!db.remove(1))
+}
+
+test "clear empties the list but not the ids" {
+    let db = Store.new()
+    db.add("one")
+    db.clear()
+    assert_eq(db.len(), 0)
+    assert_eq(db.add("two").id, 2)
+}

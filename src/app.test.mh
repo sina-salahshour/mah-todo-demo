@@ -1,0 +1,140 @@
+import "std:test"
+import process from "std:process"
+import socket from "std:socket"
+import "./app"
+import "./store"
+
+## Reads the arguments with the environment out of the way, and puts the
+## environment back the way it was.
+fn config_for(args: Vector<String>) -> Config {
+    let was_port = process.env_get("PORT")
+    let was_host = process.env_get("HOST")
+    process.env_remove("PORT")
+    process.env_remove("HOST")
+    let config = config_from_args(args)
+    if was_port == none {
+        process.env_remove("PORT")
+    } else {
+        process.env_set("PORT", was_port.unwrap_or(""))
+    }
+    if was_host == none {
+        process.env_remove("HOST")
+    } else {
+        process.env_set("HOST", was_host.unwrap_or(""))
+    }
+    config
+}
+
+## A port nothing is listening on, to be had for the asking.
+fn free_port() -> Number {
+    let probe = socket.listen(0, "127.0.0.1")
+    let port = probe.port
+    probe.close()
+    port
+}
+
+## Sends `raw` to a server listening on `port` and gives back the whole reply.
+fn exchange(port: Number, raw: String) -> String {
+    let listener = socket.listen(0, "127.0.0.1")
+    let incoming = detach listener.accept()
+    let client = socket.connect("127.0.0.1", port)
+    let server_side = incoming.await
+    client.send_text(raw)
+    client.shutdown()
+    let wire = server_side.recv(65536).to_text().unwrap_or("")
+    client.close()
+    server_side.close()
+    listener.close()
+    wire
+}
+
+test "with no arguments it listens on 4000" {
+    let config = config_for([])
+    assert_eq(config.port, 4000)
+    assert_eq(config.host, "127.0.0.1")
+}
+
+test "PORT and HOST come from the environment" {
+    process.env_set("PORT", "5555")
+    process.env_set("HOST", "0.0.0.0")
+    let config = config_from_args([])
+    assert_eq(config.port, 5555)
+    assert_eq(config.host, "0.0.0.0")
+    process.env_remove("PORT")
+    process.env_remove("HOST")
+}
+
+test "a port that is not a number falls back to the default" {
+    process.env_set("PORT", "not a number")
+    assert_eq(config_from_args([]).port, 4000)
+    process.env_remove("PORT")
+}
+
+test "the command line says the port, in every spelling" {
+    assert_eq(config_for(["--port", "9000"]).port, 9000)
+    assert_eq(config_for(["-p", "9001"]).port, 9001)
+    assert_eq(config_for(["--port=9002"]).port, 9002)
+    assert_eq(config_for(["9003"]).port, 9003)
+    assert_eq(config_for(["--host", "0.0.0.0", "--port", "9004"]).host, "0.0.0.0")
+    assert_eq(config_for(["--host=example"]).host, "example")
+}
+
+test "the command line wins over the environment" {
+    process.env_set("PORT", "5555")
+    assert_eq(config_from_args(["--port", "9005"]).port, 9005)
+    process.env_remove("PORT")
+}
+
+test "nonsense on the command line is a ConfigError" {
+    let bad = assert_throws(fn() { config_for(["--nope"]) })
+    assert_throws(fn() { config_for(["--port", "soon"]) })
+    assert_throws(fn() { config_for(["--port"]) })
+}
+
+test "usage says where it listens" {
+    let text = usage()
+    assert(text.contains("4000"))
+    assert(text.contains("--host"))
+}
+
+test "the server binds the port it was asked for" {
+    let wanted = free_port()
+    let server = start(Config { host: "127.0.0.1", port: wanted }, Store.new())
+    assert_eq(server.port(), wanted)
+    assert_eq(server.host(), "127.0.0.1")
+    assert_eq(server.url(), "http://127.0.0.1:" + wanted)
+    assert_eq(server.running, true)
+    assert_eq(server.requests, 0)
+    server.stop()
+    assert_eq(server.running, false)
+}
+
+test "port 0 hands back a free port" {
+    let server = start(Config { host: "127.0.0.1", port: 0 }, Store.new())
+    assert(server.port() > 0)
+    server.stop()
+}
+
+test "a taken port moves up to the next free one" {
+    let wanted = free_port()
+    let first = start(Config { host: "127.0.0.1", port: wanted }, Store.new())
+    let second = start(Config { host: "127.0.0.1", port: wanted }, Store.new())
+    assert_eq(first.port(), wanted)
+    assert_eq(second.port(), wanted + 1)
+
+    let third = start(Config { host: "127.0.0.1", port: wanted }, Store.new())
+    assert_eq(third.port(), wanted + 2)
+    first.stop()
+    second.stop()
+    third.stop()
+}
+
+test "no free port within reach is a SocketError" {
+    let wanted = free_port()
+    let first = start(Config { host: "127.0.0.1", port: wanted }, Store.new())
+    let e = assert_throws(
+        fn() { start(Config { host: "127.0.0.1", port: wanted }, Store.new(), 0) }
+    )
+    assert_eq(e.kind, "address_in_use")
+    first.stop()
+}

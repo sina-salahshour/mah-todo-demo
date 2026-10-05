@@ -1,0 +1,335 @@
+# A small HTTP/1.1 layer on top of std:socket: read one request off a
+# connection, write one response back, and send a path to a handler.
+#
+# Deliberately narrow: one request per connection (the response always says
+# `Connection: close`), bodies only with a Content-Length, no chunked encoding,
+# no keep-alive and no percent-decoding. Nothing in here knows about todos --
+# that is src/api.mh's job.
+# std:json is imported under another name on purpose: a method called `json`
+# (Response.json below) and a module called `json` in the same file trip up the
+# compiler's type resolution, and this file wants both.
+import jsonlib from "std:json"
+import socket from "std:socket"
+
+## The most a request body may hold, in bytes.
+export let max_body = 65536
+
+## Why a request couldn't be turned into a Request.
+export enum HttpError {
+    BadRequest { message: String },
+    BadBody { message: String },
+    BodyTooLarge { limit: Number },
+    Closed { message: String }
+}
+
+impl Error for HttpError {
+    fn message(self) -> String {
+        match self {
+            HttpError.BadRequest { message } => { message }
+            HttpError.BadBody { message } => { message }
+            HttpError.BodyTooLarge { limit } => { "a body over " + limit + " bytes" }
+            HttpError.Closed { message } => { message }
+        }
+    }
+}
+
+## What a client asked for. `path` is without the query string, `query` holds
+## everything after `?`, and the header names in `headers` are lowercased.
+export struct Request {
+    method: String,
+    path: String,
+    query: Map<String, String>,
+    headers: Map<String, String>,
+    body: String
+}
+
+## What the server answers: a status code, the headers to add to a few
+## defaults, and the body.
+export struct Response { status: Number, headers: Map<String, String>, body: String }
+
+## One route: a method, a path whose `{name}` segments are parameters, and the
+## handler to call. The handler gets the request and those parameters.
+export struct Route {
+    method: String,
+    path: String,
+    handler
+}
+
+## The routes of one server, tried in the order they were added.
+export struct Router { routes: Vector<Route> }
+
+## The reason phrase to put after a status code.
+fn reason(status: Number) -> String {
+    match status {
+        200 => { "OK" }
+        201 => { "Created" }
+        204 => { "No Content" }
+        304 => { "Not Modified" }
+        400 => { "Bad Request" }
+        403 => { "Forbidden" }
+        404 => { "Not Found" }
+        405 => { "Method Not Allowed" }
+        411 => { "Length Required" }
+        413 => { "Payload Too Large" }
+        415 => { "Unsupported Media Type" }
+        422 => { "Unprocessable Entity" }
+        500 => { "Internal Server Error" }
+        503 => { "Service Unavailable" }
+        _ => { "Unknown" }
+    }
+}
+
+## Everything after the `?` of `target`, split on `&` then `=`. Values are kept
+## exactly as they were sent: nothing is percent-decoded.
+fn parse_query(target: String) -> Map<String, String> {
+    let out = [:]
+    let mark = target.index_of("?")
+    if mark == none { return out }
+    let query = target[(mark.unwrap() + 1)..]
+    if query == "" { return out }
+    for let pair in query.split("&") {
+        if pair == "" { continue }
+        let eq = pair.index_of("=")
+        if eq == none {
+            out[pair] = ""
+        } else {
+            let at = eq.unwrap()
+            out[pair[..at]] = pair[(at + 1)..]
+        }
+    }
+    out
+}
+
+## The path part of `target`: everything before its `?`.
+fn target_path(target: String) -> String {
+    let mark = target.index_of("?")
+    if mark == none { target } else { target[..mark.unwrap()] }
+}
+
+## The path split on `/`, with one trailing slash ignored: `/todos` and
+## `/todos/` are the same path, and `/` is a single empty segment.
+fn segments(path: String) -> Vector<String> {
+    let parts = path.split("/")
+    if parts.len() > 1 & parts[parts.len() - 1] == "" { return parts[..parts.len() - 1] }
+    parts
+}
+
+## `none` unless `path` is `pattern`; a `{name}` segment of `pattern` matches
+## any one segment and is collected into the returned map.
+fn path_match(pattern: String, path: String) -> Option<Map<String, String>> {
+    let wanted = segments(pattern)
+    let got = segments(path)
+    if wanted.len() != got.len() { return none }
+    let params = [:]
+    for let i in 0..wanted.len() {
+        let part = wanted[i]
+        if part.starts_with("{") & part.ends_with("}") {
+            params[part[1..part.len() - 1]] = got[i]
+        } elif part != got[i] {
+            return none
+        }
+    }
+    some(params)
+}
+
+## The head of a request, read line by line, stopping at the empty line.
+fn read_headers(conn: socket.Socket, timeout: Number) throws HttpError | socket.SocketError {
+    let headers = [:]
+    while true {
+        let line = conn.read_line(timeout)
+        if line == none { throw HttpError.Closed { message: "the client hung up in the head" } }
+        let text = "" + line
+        if text == "" { return headers }
+        let colon = text.index_of(":")
+        if colon == none { throw HttpError.BadRequest { message: "malformed header: " + text } }
+        let at = colon.unwrap()
+        let name = text[..at].trim().to_lower()
+        if name == "" { throw HttpError.BadRequest { message: "a header with no name" } }
+        headers[name] = text[(at + 1)..].trim()
+    }
+}
+
+## The body, as far as the headers say how long it is: none without a
+## Content-Length, that many bytes with one.
+fn read_body(
+    conn: socket.Socket,
+    headers: Map<String, String>,
+    timeout: Number
+) throws HttpError | socket.SocketError {
+    if headers.has("transfer-encoding") {
+        throw HttpError.BadRequest { message: "chunked bodies are not supported" }
+    }
+    if !headers.has("content-length") { return "" }
+    let raw = headers["content-length"]
+    let length = raw.parse_number()
+    if length == none {
+        throw HttpError.BadRequest { message: "Content-Length is not a number: " + raw }
+    }
+    if length > max_body { throw HttpError.BodyTooLarge { limit: max_body } }
+    if length <= 0 { return "" }
+    let data = conn.recv_exactly(length, timeout)
+    match data.to_text() {
+        some(text) => { text }
+        none => { throw HttpError.BadBody { message: "the body is not valid UTF-8 text" } }
+    }
+}
+
+## The whole of `res` as it goes on the wire: the status line, the headers it
+## needs, a blank line and the body.
+export fn response_to_text(res: Response) -> String {
+    let headers = res.headers.copy()
+    if !headers.has("content-type") { headers["content-type"] = "text/plain; charset=utf-8" }
+    headers["content-length"] = res.body.to_bytes().len().to_string()
+    if !headers.has("connection") { headers["connection"] = "close" }
+    let lines = ["HTTP/1.1 " + res.status + " " + reason(res.status)]
+    for let name in headers {
+        lines.push(name + ": " + headers[name])
+    }
+    lines.join("\r\n") + "\r\n\r\n" + res.body
+}
+
+## Sends `res` on `conn`, and reports whether it went out: `false` means the
+## client had already gone away.
+export fn send_response(conn: socket.Socket, res: Response) -> Bool {
+    try {
+        conn.send_text(response_to_text(res))
+        true
+    } catch {
+        e: socket.SocketError => { false }
+    }
+}
+
+## Reads one request off `conn`, waiting at most `timeout` milliseconds for
+## each piece of it. Throws HttpError, or a socket.SocketError when the
+## connection itself fails (a timeout, say).
+export fn read_request(
+    conn: socket.Socket,
+    timeout: Number = 5000
+) throws HttpError | socket.SocketError {
+    let line = conn.read_line(timeout)
+    if line == none { throw HttpError.Closed { message: "the client hung up before a request" } }
+    let parts = ("" + line).split()
+    if parts.len() != 3 {
+        throw HttpError.BadRequest {
+            message: "a request line needs a method, a target and a version"
+        }
+    }
+    let version = parts[2]
+    if version != "HTTP/1.1" & version != "HTTP/1.0" {
+        throw HttpError.BadRequest { message: "only HTTP/1.0 and HTTP/1.1 are served" }
+    }
+    let target = parts[1]
+    if !target.starts_with("/") {
+        throw HttpError.BadRequest { message: "a request target must start with /" }
+    }
+    let headers = read_headers(conn, timeout)
+    let body = read_body(conn, headers, timeout)
+    Request {
+        method: parts[0].to_upper(),
+        path: target_path(target),
+        query: parse_query(target),
+        headers: headers,
+        body: body
+    }
+}
+
+impl Response {
+    fn new(status: Number, body: String = "") -> Response {
+        Response { status: status, headers: [:], body: body }
+    }
+
+    ## `value` as a JSON body.
+    fn json(value: Unknown, status: Number = 200) -> Response {
+        let body = try { jsonlib.stringify(value) } catch { _: jsonlib.JsonError => { "null" } }
+        Response {
+            status: status,
+            headers: ["content-type": "application/json; charset=utf-8"],
+            body: body
+        }
+    }
+
+    ## `text` as a plain-text body.
+    fn text(text: String, status: Number = 200) -> Response {
+        Response {
+            status: status,
+            headers: ["content-type": "text/plain; charset=utf-8"],
+            body: text
+        }
+    }
+
+    ## `body` as an HTML page, for a browser.
+    fn html(body: String, status: Number = 200) -> Response {
+        Response {
+            status: status,
+            headers: ["content-type": "text/html; charset=utf-8"],
+            body: body
+        }
+    }
+
+    ## A status with no body at all.
+    fn empty(status: Number) -> Response { Response.new(status, "") }
+
+    ## `{"error": code, "message": message}` with the given status.
+    fn error(status: Number, code: String, message: String) -> Response {
+        Response.json(["error": code, "message": message], status)
+    }
+}
+
+impl Router {
+    fn new() -> Router { Router { routes: [] } }
+
+    ## Adds a route. The method is uppercased, so `get` and `GET` are the same.
+    fn add(self, method: String, path: String, handler) {
+        self.routes.push(Route { method: method.to_upper(), path: path, handler: handler })
+    }
+
+    fn get(self, path: String, handler) {
+        self.add("GET", path, handler)
+    }
+
+    fn post(self, path: String, handler) {
+        self.add("POST", path, handler)
+    }
+
+    fn put(self, path: String, handler) {
+        self.add("PUT", path, handler)
+    }
+
+    fn patch(self, path: String, handler) {
+        self.add("PATCH", path, handler)
+    }
+
+    fn delete(self, path: String, handler) {
+        self.add("DELETE", path, handler)
+    }
+
+    ## The routes as `"METHOD /path"`, for a startup banner or an index page.
+    fn describe(self) -> Vector<String> {
+        let out = []
+        for let route in self.routes {
+            out.push(route.method + " " + route.path)
+        }
+        out
+    }
+
+    ## Answers `req`: the first route whose method and path match, or 405 with
+    ## an `Allow` header when only the path matches, or 404 when nothing does.
+    fn dispatch(self, req: Request) -> Response {
+        let method = req.method.to_upper()
+        let allowed = []
+        for let route in self.routes {
+            let params = path_match(route.path, req.path)
+            if params == none { continue }
+            if route.method == method {
+                return (route.handler)(req, params.unwrap_or([:]))
+            }
+            allowed.push(route.method)
+        }
+        if allowed.len() > 0 {
+            let res = Response.error(405, "method_not_allowed", method + " is not allowed here")
+            res.headers["allow"] = allowed.join(", ")
+            return res
+        }
+        Response.error(404, "not_found", "no route for " + req.path)
+    }
+}

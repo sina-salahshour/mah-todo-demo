@@ -1,0 +1,120 @@
+import "std:test"
+import "./http"
+
+## A request as a client would send it, for the router tests below.
+fn request(method: String, target: String, body: String = "") -> Request {
+    let headers = [:]
+    if body != "" { headers["content-length"] = body.len().to_string() }
+    Request {
+        method: method.to_upper(),
+        path: target_path(target),
+        query: parse_query(target),
+        headers: headers,
+        body: body
+    }
+}
+
+test "a target splits into a path and a query" {
+    assert_eq(target_path("/todos?done=true"), "/todos")
+    assert_eq(target_path("/todos"), "/todos")
+    assert_eq(target_path("/todos?"), "/todos")
+}
+
+test "the query is a map, with nothing decoded" {
+    assert_eq(parse_query("/todos").len(), 0)
+    assert_eq(parse_query("/todos?").len(), 0)
+    assert_eq(parse_query("/todos?a=1&b=2")["a"], "1")
+    assert_eq(parse_query("/todos?a=1&a=3")["a"], "3")
+    assert_eq(parse_query("/todos?flag")["flag"], "")
+    assert_eq(parse_query("/todos?q=a%20b")["q"], "a%20b")
+}
+
+test "segments drops a trailing slash and keeps an empty root" {
+    assert_eq(segments("/").len(), 1)
+    assert_eq(segments("")[0], "")
+    assert_eq(segments("/todos/").len(), 2)
+    assert_eq(segments("/todos/7").len(), 3)
+    assert_eq(segments("/todos/7")[2], "7")
+}
+
+test "a pattern matches itself and collects its names" {
+    assert_eq(path_match("/todos", "/todos").unwrap().len(), 0)
+    assert_eq(path_match("/todos/{id}", "/nope"), none)
+    assert_eq(path_match("/todos", "/todos/7"), none)
+    let matched = path_match("/todos/{id}/toggle", "/todos/7/toggle")
+    assert_eq(matched.unwrap()["id"], "7")
+}
+
+test "every status has a reason phrase" {
+    assert_eq(reason(200), "OK")
+    assert_eq(reason(201), "Created")
+    assert_eq(reason(204), "No Content")
+    assert_eq(reason(404), "Not Found")
+    assert_eq(reason(999), "Unknown")
+}
+
+test "a response on the wire has a status line, headers and a body" {
+    let wire = response_to_text(Response.text("hello", 201))
+    let lines = wire.split("\r\n")
+    assert_eq(lines[0], "HTTP/1.1 201 Created")
+    assert(wire.contains("content-type: text/plain; charset=utf-8"))
+    assert(wire.contains("content-length: 5"))
+    assert(wire.contains("connection: close"))
+    assert_eq(lines[lines.len() - 2], "")
+    assert_eq(lines[lines.len() - 1], "hello")
+}
+
+test "json, html and empty bodies say what they are" {
+    assert_eq(Response.json(["a": 1]).headers["content-type"], "application/json; charset=utf-8")
+    assert_eq(Response.json(["a": 1]).body, "{\"a\":1}")
+    assert_eq(Response.html("<p>hi</p>").headers["content-type"], "text/html; charset=utf-8")
+    assert_eq(Response.html("<p>hi</p>").status, 200)
+    assert_eq(Response.empty(204).body, "")
+}
+
+test "an error is json with the code and the message in it" {
+    let res = Response.error(404, "not_found", "no such todo")
+    assert_eq(res.status, 404)
+    assert_eq(res.body, "{\"error\":\"not_found\",\"message\":\"no such todo\"}")
+}
+
+test "a router answers what it has a route for" {
+    let router = Router.new()
+    router.get("/todos", fn(req, params) -> Response { Response.text("listed") })
+    assert_eq(router.dispatch(request("GET", "/todos")).body, "listed")
+    assert_eq(router.dispatch(request("get", "/todos")).status, 200)
+}
+
+test "the method has to match too" {
+    let router = Router.new()
+    router.get("/todos", fn(req, params) -> Response { Response.text("listed") })
+    let wrong = router.dispatch(request("POST", "/todos"))
+    assert_eq(wrong.status, 405)
+    assert(wrong.headers.has("allow"))
+}
+
+test "an unknown path is a 404" {
+    let router = Router.new()
+    router.get("/todos", fn(req, params) -> Response { Response.text("listed") })
+    let gone = router.dispatch(request("GET", "/nope"))
+    assert_eq(gone.status, 404)
+    assert_eq(gone.body, "{\"error\":\"not_found\",\"message\":\"no route for /nope\"}")
+}
+
+test "path parameters reach the handler" {
+    let router = Router.new()
+    router.get("/todos/{id}", fn(req, params) -> Response { Response.text(params["id"]) })
+    assert_eq(router.dispatch(request("GET", "/todos/7")).body, "7")
+}
+
+test "describe lists every route in the order it was added" {
+    let router = Router.new()
+    router.get("/todos", fn(req, params) -> Response { Response.text("") })
+    router.post("/todos", fn(req, params) -> Response { Response.text("") })
+    router.get("/todos/{id}", fn(req, params) -> Response { Response.text("") })
+    let routes = router.describe()
+    assert_eq(routes.len(), 3)
+    assert_eq(routes[0], "GET /todos")
+    assert_eq(routes[2], "GET /todos/{id}")
+}
+

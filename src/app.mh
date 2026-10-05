@@ -1,0 +1,174 @@
+# Starting the server and answering connections: the command line, the
+# listening socket, and the accept loop. The routes come from src/api.mh.
+import process from "std:process"
+import socket from "std:socket"
+import api from "./api"
+import http from "./http"
+import store from "./store"
+
+## Where to listen. `PORT` and `HOST` in the environment win over the
+## defaults; the command line wins over both.
+export struct Config { host: String, port: Number }
+
+## A command-line argument that doesn't mean anything.
+export struct ConfigError { problem: String }
+
+impl Error for ConfigError {
+    fn message(self) -> String { self.problem }
+}
+
+## The listening socket, the routes on it, and how many requests it has
+## answered. Everything else here mutates it in place.
+export struct Server {
+    listener: socket.Listener,
+    router: http.Router,
+    running: Bool,
+    requests: Number
+}
+
+## What to print when the arguments don't add up.
+export fn usage() -> String {
+    [
+        "usage: mah run -- [--port PORT] [--host HOST]",
+        "",
+        "  --port PORT, -p PORT   the port to listen on (default 4000, 0 picks",
+        "                         a free one; a taken port moves up to the next)",
+        "  --host HOST, -h HOST   the address to bind (default 127.0.0.1)",
+        "  PORT                   a bare number works as --port",
+        "",
+        "environment: PORT, HOST"
+    ].join("\n")
+}
+
+## The value of `--flag value` or `--flag=value`, or a BadArgument when
+## nothing follows the flag.
+fn flag_value(args: Vector<String>, i: Number, flag: String) throws ConfigError {
+    let arg = args[i]
+    let eq = arg.index_of("=")
+    if eq != none { return arg[(eq.unwrap() + 1)..] }
+    if i + 1 < args.len() { return args[i + 1] }
+    throw ConfigError { problem: flag + " needs a value" }
+}
+
+## Reads the command line. A bare number is a port; anything unknown throws
+## ConfigError. Never writes to the environment or the terminal.
+export fn config_from_args(args: Vector<String>) throws ConfigError {
+    let host = process.env_get("HOST").unwrap_or("127.0.0.1")
+    let port_env = process.env_get("PORT").unwrap_or("4000")
+    let port = port_env.parse_number()
+    let config = Config { host: host, port: if port == none { 4000 } else { port } }
+    let i = 0
+    while i < args.len() {
+        let arg = args[i]
+        let skip = 0
+        if arg == "--port" | arg == "-p" | arg.starts_with("--port=") {
+            let raw = flag_value(args, i, "--port")
+            let n = raw.parse_number()
+            if n == none { throw ConfigError { problem: "--port needs a number, got " + raw } }
+            config.port = n
+            skip = if arg.contains("=") { 0 } else { 1 }
+        } elif arg == "--host" | arg == "-h" | arg.starts_with("--host=") {
+            config.host = flag_value(args, i, "--host")
+            skip = if arg.contains("=") { 0 } else { 1 }
+        } elif arg.parse_number() != none {
+            config.port = arg.parse_number()
+        } else {
+            throw ConfigError { problem: "I don't know what to do with " + arg }
+        }
+        i = i + 1 + skip
+    }
+    config
+}
+
+## A server for the todo API, bound to `config`'s socket. Nothing is accepted
+## until serve runs. When the port asked for is already taken the next one is
+## tried, and the one after that, so a second copy of the program starts
+## alongside the first instead of giving up; `tries` is how far up it will go.
+## Throws socket.SocketError for any other reason (a host that won't bind, no
+## free port within `tries`). Port 0 asks the system for a free port, which
+## `Server.port` then reports.
+export fn start(config: Config, db: store.Store, tries: Number = 100) throws socket.SocketError {
+    let port = config.port
+    let left = tries
+    while true {
+        let listener = try { socket.listen(port, config.host) } catch {
+            e: socket.SocketError => {
+                if e.kind != "address_in_use" | left <= 0 { throw e }
+                left = left - 1
+                port = port + 1
+                continue
+            }
+        }
+        return Server {
+            listener: listener,
+            router: api.build(db),
+            running: true,
+            requests: 0
+        }
+    }
+}
+
+impl Server {
+    ## The port actually bound, which is the one to talk to when 0 was asked
+    ## for.
+    fn port(self) -> Number { self.listener.port }
+
+    fn host(self) -> String { self.listener.host }
+
+    ## The URL to open.
+    fn url(self) -> String { "http://" + self.host() + ":" + self.port() }
+
+    ## Ends serve: the pending accept fails with "closed", so the loop returns.
+    fn stop(self) {
+        self.running = false
+        try {
+            self.listener.close()
+        } catch {
+            e: socket.SocketError => { }
+        }
+    }
+
+    ## One connection: read a request, route it, write the answer. Every way
+    ## this can go wrong ends in a response or in a closed connection, never
+    ## in a failure the accept loop would have to know about.
+    fn handle(self, conn: socket.Socket) {
+        defer conn.close()
+        let peer = conn.peer_host + ":" + conn.peer_port
+        let req = try { http.read_request(conn) } catch {
+            e: http.HttpError => {
+                http.send_response(conn, http.Response.error(400, "bad_request", e.message()))
+                self.log(peer, "-", "-", 400)
+                return
+            }
+            e: socket.SocketError => {
+                self.log(peer, "-", "-", 0);
+                return
+            }
+        }
+        let res = self.router.dispatch(req)
+        self.requests = self.requests + 1
+        http.send_response(conn, res)
+        self.log(peer, req.method, req.path, res.status)
+    }
+
+    ## One line per request: who asked for what, and what it got. A status of 0
+    ## means the connection failed before there was a request to answer.
+    fn log(self, peer: String, method: String, path: String, status: Number) {
+        print(self.url() + " " + peer + " " + method + " " + path + " -> " + status)
+    }
+}
+
+## Answers connections until `stop` is called, each one in a task of its own so
+## that a slow client can't hold up the next one.
+export fn serve(server: Server) {
+    while server.running {
+        let conn = try { server.listener.accept() } catch {
+            e: socket.SocketError => {
+                server.log("-", "accept", "-", 0)
+                print("accept: " + e.message())
+                return
+            }
+        }
+        detach server.handle(conn)
+    }
+}
