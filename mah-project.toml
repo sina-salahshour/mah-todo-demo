@@ -26,7 +26,7 @@ self-contained = true
 # [[target]]
 # name = "dist"
 # profile = "release"
-# out = "build/p05"
+# out = "build/mah-todo"
 # self-contained = true
 
 # How `mah run` runs the project: vm = "python" (the reference VM) or

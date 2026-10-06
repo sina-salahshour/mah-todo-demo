@@ -215,7 +215,7 @@ fn delete_todo(
 ## The described API over `db`: its router answers every route above.
 export fn describe(db: store.Store) -> Api throws SetupError {
     let api = Api.new(
-        "p05 todo api",
+        "Mah Todo API",
         version,
         "A todo list kept in memory by a server written in Mah. Every route is a plain function; this document is written from their declarations with std:reflect."
     )

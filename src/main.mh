@@ -1,4 +1,4 @@
-# p05 -- a REST API for a todo list, written in Mah.
+# mah-todo -- a REST API for a todo list, written in Mah.
 #
 #   mah run                     # http://127.0.0.1:4000, or the next free port
 #   mah run -- 9000             # a bare number picks the port
@@ -14,7 +14,7 @@ import store from "./store"
 
 let config = try { app.config_from_args(process.args()) } catch {
     e: app.ConfigError => {
-        print("p05: " + e.message())
+        print("mah-todo: " + e.message())
         print(app.usage())
         process.exit(2)
     }
@@ -22,11 +22,11 @@ let config = try { app.config_from_args(process.args()) } catch {
 
 let server = try { app.start(config, store.Store.new()) } catch {
     e: socket.SocketError => {
-        print("p05: cannot listen on " + config.host + ":" + config.port + ": " + e.message())
+        print("mah-todo: cannot listen on " + config.host + ":" + config.port + ": " + e.message())
         process.exit(1)
     }
     e: rest.SetupError => {
-        print("p05: a route is declared wrong: " + e.message())
+        print("mah-todo: a route is declared wrong: " + e.message())
         process.exit(1)
     }
 }

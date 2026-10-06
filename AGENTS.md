@@ -1,4 +1,4 @@
-# p05
+# mah-todo
 
 A project written in **Mah**, a small dynamically typed language (`.mh`
 files). Mah isn't a mainstream language, so don't guess its syntax from
@@ -35,8 +35,8 @@ mah build                   # write every [[target]] from mah-project.toml
 mah build --target release  # write one target
 mah check                   # run the static type checker and print its diagnostics
 mah test                    # run every test (*.test.mh); `mah test NAME` runs the matching ones
-mah runc build/p05.mahc   # run a compiled file (or just ./build/p05.mahc; `-- ARGS` works here too)
-mah dis build/p05.mahc    # show the compiled bytecode
+mah runc build/todo.mahc    # run a compiled file (or just ./build/todo.mahc; `-- ARGS` works here too)
+mah dis build/todo.mahc     # show the compiled bytecode
 mah run --vm rust           # run on the native Rust runtime (if it's installed)
 mah build --self-contained  # make every target standalone (runs without mah, same OS/CPU)
 mah format                  # lay out every .mh file in the standard style

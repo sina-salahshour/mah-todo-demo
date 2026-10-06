@@ -191,7 +191,7 @@ test "the browser pages and the openapi document come over the wire" {
         let docs = http.get(server.url() + "/docs").check_status()
         assert(docs.text().contains("SwaggerUIBundle"))
         let spec = http.get(server.url() + "/openapi.json").json()
-        assert_eq(spec["info"]["title"], "p05 todo api")
+        assert_eq(spec["info"]["title"], "Mah Todo API")
     })
 }
 

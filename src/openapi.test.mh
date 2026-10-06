@@ -13,7 +13,7 @@ fn spec() -> Unknown {
 test "the document says what it is" {
     let doc = spec()
     assert_eq(doc["openapi"], "3.0.3")
-    assert_eq(doc["info"]["title"], "p05 todo api")
+    assert_eq(doc["info"]["title"], "Mah Todo API")
     assert_eq(doc["info"]["version"], api.version)
     assert_eq(doc["servers"][0]["url"], "/")
     assert_eq(doc["tags"][0]["name"], "todos")
