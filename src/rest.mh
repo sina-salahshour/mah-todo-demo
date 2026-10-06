@@ -1,0 +1,376 @@
+# Routes as plain, decorated functions. A handler says what it is with
+# decorators, and std:reflect reads the rest off its declaration:
+#
+#   ## Fetches one todo.
+#   @get("/todos/{id}", errors: [404])
+#   fn get_todo(db: store.Store, @path id: Number) -> store.Todo { ... }
+#
+# Each route decorator registers its function as the program starts (it is a
+# std:reflect WrapFn hook), and `mount` turns those functions into http.Router
+# routes: `@path` and `@query` parameters are read from the request and
+# converted to their annotated type (Number, Bool, String, or an Option of
+# one), a `@body`
+# parameter is the JSON body read with std:json's `parse_as` into its
+# annotated struct, and any other parameter is filled with the context value
+# of its type (the store, or the Api itself). What the function returns
+# becomes the answer: a struct as JSON, `Created` as a 201 with a Location,
+# `none` from a `-> None` handler as a 204, and an http.Response as it is. A
+# thrown ApiError becomes an http.ErrorBody with its status.
+#
+# The same declarations are what src/openapi.mh turns into an OpenAPI
+# document: the `##` docs, the parameter and return types, and the fields of
+# the structs they name. One source of truth, read two ways.
+import json from "std:json"
+import reflect from "std:reflect"
+import http from "./http"
+
+## What `@get(...)`, `@post(...)`, ... put on a handler.
+export struct Route {
+    method: String,
+    ## The path, with a `{name}` segment for each `@path` parameter.
+    path: String,
+    ## The error statuses the handler throws on purpose (a 400 for a request
+    ## that can't be read is added on its own).
+    errors: Vector<Number>,
+    ## Where the operation is grouped in the OpenAPI document.
+    tags: Vector<String>,
+    ## False for a route that isn't part of the API (a page for a browser):
+    ## it is served, but left out of the OpenAPI document.
+    listed: Bool
+}
+
+## Every function a route decorator is on, in the order they were declared.
+let declared: Vector<Unknown> = []
+
+# A route decorator is also a hook: at startup, std:reflect hands it the
+# function it decorates, which it records for `registered` and leaves as it is.
+impl reflect.WrapFn for Route {
+    fn wrap(self, f: Unknown, info: reflect.FnInfo) -> Unknown {
+        declared.push(info.function)
+        f
+    }
+}
+
+## Every handler declared so far with `@get`/`@post`/`@put`/`@patch`/`@delete`,
+## in declaration order -- the order the router tries them in, so declare a
+## fixed path (`/todos/done`) before a parameter that would match it too
+## (`/todos/{id}`).
+export fn registered() -> Vector<Unknown> { declared.copy() }
+
+## A route for GET `path` (see Route).
+export fn get(
+    path: String,
+    errors: Vector<Number> = [],
+    tags: Vector<String> = [],
+    listed: Bool = true
+) -> Route {
+    Route { method: "GET", path: path, errors: errors, tags: tags, listed: listed }
+}
+
+## A route for POST `path`.
+export fn post(path: String, errors: Vector<Number> = [], tags: Vector<String> = []) -> Route {
+    Route { method: "POST", path: path, errors: errors, tags: tags, listed: true }
+}
+
+## A route for PUT `path`.
+export fn put(path: String, errors: Vector<Number> = [], tags: Vector<String> = []) -> Route {
+    Route { method: "PUT", path: path, errors: errors, tags: tags, listed: true }
+}
+
+## A route for PATCH `path`.
+export fn patch(path: String, errors: Vector<Number> = [], tags: Vector<String> = []) -> Route {
+    Route { method: "PATCH", path: path, errors: errors, tags: tags, listed: true }
+}
+
+## A route for DELETE `path`.
+export fn delete(path: String, errors: Vector<Number> = [], tags: Vector<String> = []) -> Route {
+    Route { method: "DELETE", path: path, errors: errors, tags: tags, listed: true }
+}
+
+## Marks a parameter as the `{name}` segment of the path with its name.
+export fn path(value: Unknown) -> Unknown { value }
+
+## Marks a parameter as the `?name=` of the query string with its name. Give
+## it an Option type to make it optional.
+export fn query(value: Unknown) -> Unknown { value }
+
+## Marks a parameter as the request's JSON body, read into its annotated type.
+export fn body(value: Unknown) -> Unknown { value }
+
+## An example value for a struct field, shown in the OpenAPI document:
+## `@example("buy milk") title: String`.
+export struct Example { value: Unknown }
+
+export fn example(value: Unknown) -> Example { Example { value: value } }
+
+## What a handler returns for "made it": a 201 with `value` as the body and a
+## Location header pointing at it.
+export struct Created<T> { value: T, location: String }
+
+## An answer other than success, thrown by a handler: the status, and the
+## `error` code and message of the http.ErrorBody it becomes.
+export struct ApiError { status: Number, code: String, detail: String }
+
+impl Error for ApiError {
+    fn message(self) -> String { self.detail }
+}
+
+export fn bad_request(detail: String) -> ApiError {
+    ApiError { status: 400, code: "bad_request", detail: detail }
+}
+
+export fn not_found(detail: String) -> ApiError {
+    ApiError { status: 404, code: "not_found", detail: detail }
+}
+
+export fn unprocessable(code: String, detail: String) -> ApiError {
+    ApiError { status: 422, code: code, detail: detail }
+}
+
+## A handler that can't be mounted: no route decorator, a parameter nothing
+## can fill, a `{name}` without its `@path` parameter.
+export struct SetupError { problem: String }
+
+impl Error for SetupError {
+    fn message(self) -> String { self.problem }
+}
+
+## Where one argument of a handler comes from. A Query that isn't `required`
+## (an Option, or a parameter with a default) may be left out.
+export enum Source {
+    Path { name: String, type: reflect.TypeRef },
+    Query { name: String, type: reflect.TypeRef, required: Bool },
+    Body { type: reflect.TypeRef },
+    Context { value: Unknown }
+}
+
+## One mounted handler: its route, its declaration, and where each of its
+## arguments comes from.
+export struct Operation {
+    route: Route,
+    signature: reflect.Signature,
+    sources: Vector<Source>
+}
+
+## A described API: what it is called, and every operation mounted on its
+## router. A handler can take the Api itself as a parameter (the OpenAPI
+## document does).
+export struct Api {
+    title: String,
+    version: String,
+    description: String,
+    ## The OpenAPI tags, `[name, description]`, in the order to show them.
+    tags: Vector<Vector<String>>,
+    router: http.Router,
+    operations: Vector<Operation>
+}
+
+impl Api {
+    fn new(title: String, version: String, description: String = "") -> Api {
+        Api {
+            title: title,
+            version: version,
+            description: description,
+            tags: [],
+            router: http.Router.new(),
+            operations: []
+        }
+    }
+
+    ## Names an OpenAPI tag, in the order the tags should be shown.
+    fn tag(self, name: String, description: String) {
+        self.tags.push([name, description])
+    }
+}
+
+# -- types --------------------------------------------------------------------
+
+## The type a TypeRef names (`Option<Bool>` is Option), or none for one that
+## names no type (Unknown, a type parameter).
+export fn named(t: reflect.TypeRef) -> Unknown {
+    match t {
+        reflect.TypeRef.Named { type: found, args: args } => { found }
+        _ => { none }
+    }
+}
+
+## The `n`th type argument of a TypeRef (`Vector<Todo>`'s 0th is Todo), or
+## Unknown.
+export fn argument(t: reflect.TypeRef, n: Number) -> reflect.TypeRef {
+    match t {
+        reflect.TypeRef.Named { type: found, args: args } => {
+            if n < args.len() { args[n] } else { reflect.TypeRef.Unknown }
+        }
+        _ => { reflect.TypeRef.Unknown }
+    }
+}
+
+## Whether a value of type `t` may be left out.
+export fn optional(t: reflect.TypeRef) -> Bool { named(t) == Option }
+
+## `raw`, a piece of the path or the query, as a value of type `t`. `what`
+## names it for the error: "the id in the path", "?done=".
+fn convert(raw: String, t: reflect.TypeRef, what: String) -> Unknown throws ApiError {
+    let kind = named(t)
+    if kind == Option { return some(convert(raw, argument(t, 0), what)) }
+    if kind == Number {
+        let n = raw.parse_number()
+        if n == none { throw bad_request(what + " must be a number, not " + raw) }
+        return n
+    }
+    if kind == Bool {
+        if raw == "true" { return true }
+        if raw == "false" { return false }
+        throw bad_request(what + " takes true or false, not " + raw)
+    }
+    raw
+}
+
+# -- mounting -----------------------------------------------------------------
+
+## The `{name}`s of a route path.
+fn path_names(route_path: String) -> Vector<String> {
+    let out = []
+    for let part in route_path.split("/") {
+        if part.starts_with("{") & part.ends_with("}") { out.push(part[1..part.len() - 1]) }
+    }
+    out
+}
+
+## Where each parameter of `sig` comes from. `context` holds the values to
+## hand to the undecorated parameters, matched on their annotated type.
+fn sources_of(sig: reflect.Signature, r: Route, context: Vector<Unknown>) throws SetupError {
+    let out = []
+    let seen = []
+    for let p in sig.params {
+        if reflect.find(p.decorators, path) != none {
+            seen.push(p.name)
+            out.push(Source.Path { name: p.name, type: p.type })
+        } elif reflect.find(p.decorators, query) != none {
+            let required = !optional(p.type) & !p.has_default
+            out.push(Source.Query { name: p.name, type: p.type, required: required })
+        } elif reflect.find(p.decorators, body) != none {
+            out.push(Source.Body { type: p.type })
+        } else {
+            let wanted = named(p.type)
+            let value = for let v in context {
+                if reflect.type_of(v) == wanted { break some(v) }
+            }
+            if value == none {
+                throw SetupError {
+                    problem: sig.name + ": nothing to pass as " + p.name + " (mark it @path, @query or @body)"
+                }
+            }
+            out.push(Source.Context { value: value.unwrap() })
+        }
+    }
+    for let name in path_names(r.path) {
+        if !seen.reduce(fn(found, s) { found | s == name }, false) {
+            throw SetupError {
+                problem: sig.name + ": " + r.path + " has {" + name + "} but no @path " + name
+            }
+        }
+    }
+    out
+}
+
+## The arguments for one call of the handler, by parameter name, read off
+## `req`. A query parameter that isn't there is left out, so its default
+## applies (an Option without one is none).
+fn arguments(
+    sig: reflect.Signature,
+    sources: Vector<Source>,
+    req: http.Request,
+    params: Map<String, String>
+) -> Map<String, Unknown> throws ApiError {
+    let args = [:]
+    for let source, let i in sources {
+        let name = sig.params[i].name
+        match source {
+            Source.Path { name: _, type: t } => {
+                args[name] = convert(params[name], t, "the " + name + " in the path")
+            }
+            Source.Query { name: _, type: t, required: required } => {
+                if req.query.has(name) {
+                    args[name] = convert(req.query[name], t, "?" + name + "=")
+                } elif required {
+                    throw bad_request("?" + name + "= is required")
+                } elif !sig.params[i].has_default {
+                    args[name] = none
+                }
+            }
+            Source.Body { type: t } => {
+                if req.body.trim() == "" { throw bad_request("a JSON body is required") }
+                args[name] = try { json.parse_as(named(t), req.body) } catch {
+                    e: json.JsonError => { throw bad_request(e.message()) }
+                }
+            }
+            Source.Context { value } => { args[name] = value }
+        }
+    }
+    args
+}
+
+## What the handler's result `value` is on the wire.
+fn answer(value: Unknown, sig: reflect.Signature) -> http.Response {
+    let kind = reflect.type_of(value)
+    if kind == http.Response { return value }
+    if kind == Created {
+        let res = http.Response.json(value.value, 201)
+        res.headers["location"] = value.location
+        return res
+    }
+    if value == none & named(sig.returns) == None { return http.Response.empty(204) }
+    http.Response.json(value)
+}
+
+## Calls `handler` for one request and turns what happens into a Response:
+## an ApiError into its status, anything else that escapes into a 500.
+fn invoke(
+    handler: Unknown,
+    op: Operation,
+    req: http.Request,
+    params: Map<String, String>
+) -> http.Response {
+    try {
+        let args = arguments(op.signature, op.sources, req, params)
+        answer(reflect.call(handler, [], args), op.signature)
+    } catch {
+        e: ApiError => { http.Response.error(e.status, e.code, e.detail) }
+        e => {
+            print(op.route.method + " " + req.path + " failed: " + e)
+            http.Response.error(500, "internal", "something went wrong on our side")
+        }
+    }
+}
+
+## The route handler for one operation (a function of its own, so each route
+## keeps its own `handler` and `op`).
+fn adapter(handler: Unknown, op: Operation) {
+    fn(req: http.Request, params: Map<String, String>) -> http.Response {
+        invoke(handler, op, req, params)
+    }
+}
+
+## Adds every one of `handlers` (functions with a route decorator) to the
+## Api's router, in order. `context` holds the values handed to parameters
+## that aren't `@path`/`@query`/`@body`; the Api itself is always there.
+export fn mount(
+    api: Api,
+    handlers: Vector<Unknown>,
+    context: Vector<Unknown> = []
+) throws SetupError {
+    let everything = context.copy()
+    everything.push(api)
+    for let handler in handlers {
+        let sig = reflect.signature(handler)
+        let found = reflect.find(sig.decorators, Route)
+        if found == none {
+            throw SetupError { problem: sig.name + " has no @get/@post/@put/@patch/@delete" }
+        }
+        let r = found.unwrap()
+        let op = Operation { route: r, signature: sig, sources: sources_of(sig, r, everything) }
+        api.operations.push(op)
+        api.router.add(r.method, r.path, adapter(handler, op))
+    }
+}

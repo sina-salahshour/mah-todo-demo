@@ -1,0 +1,173 @@
+import "std:test"
+import reflect from "std:reflect"
+import http from "./http"
+import "./rest"
+
+## A thing the handlers below are handed.
+struct Counter { n: Number }
+
+struct Echo { id: Number, flag: Option<Bool>, word: String }
+
+struct Input { name: String }
+
+@get("/echo/{id}")
+fn echo(@path id: Number, @query flag: Option<Bool>, @query word: String = "") -> Echo {
+    Echo { id: id, flag: flag, word: word }
+}
+
+@post("/count")
+fn bump(counter: Counter, @body input: Input) -> Created<Input> {
+    counter.n = counter.n + 1
+    Created { value: input, location: "/count/" + counter.n }
+}
+
+@delete("/count", errors: [404])
+fn reset(counter: Counter) -> None {
+    if counter.n == 0 { throw not_found("nothing to reset") }
+    counter.n = 0
+}
+
+@get("/broken")
+fn broken() -> Number { 1 / 0 }
+
+@get("/page", listed: false)
+fn page() -> http.Response { http.Response.html("<p>hi</p>") }
+
+fn undecorated() -> Number { 1 }
+
+@get("/needs")
+fn needs_a_store(store: Input) -> Number { 1 }
+
+@get("/things/{id}")
+fn forgets_the_id() -> Number { 1 }
+
+## A Counter and an Api with every good handler above mounted on it.
+struct Fixture { counter: Counter, api: Api }
+
+fn fixture() -> Fixture {
+    let counter = Counter { n: 0 }
+    let api = Api.new("test", "1.0")
+    mount(api, [echo, bump, reset, broken, page], [counter])
+    Fixture { counter: counter, api: api }
+}
+
+fn ask(
+    fx: Fixture,
+    method: String,
+    target: String,
+    query: Map<String, String> = [:],
+    body: String = ""
+) -> http.Response {
+    fx.api.router.dispatch(
+        http.Request {
+            method: method,
+            path: target,
+            query: query,
+            headers: [:],
+            body: body
+        }
+    )
+}
+
+test "every route decorator registers its function, in declaration order" {
+    let names = registered().map(fn(f) { reflect.signature(f).name }).reduce()
+    assert_eq(names.len(), 7)
+    assert_eq(names[0], "echo")
+    assert_eq(names[4], "page")
+    assert_eq(names[6], "forgets_the_id")
+    assert_eq(echo(1, none, word: "x").word, "x") # still the plain function
+}
+
+test "decorators make routes, in order" {
+    let fx = fixture()
+    assert_eq(fx.api.operations.len(), 5)
+    let routes = fx.api.router.describe()
+    assert_eq(routes[0], "GET /echo/{id}")
+    assert_eq(routes[1], "POST /count")
+    assert_eq(routes[2], "DELETE /count")
+    assert_eq(fx.api.operations[2].route.errors[0], 404)
+    assert_eq(fx.api.operations[4].route.listed, false)
+}
+
+test "path and query parameters arrive as their declared types" {
+    let fx = fixture()
+    let res = ask(fx, "GET", "/echo/7", ["flag": "true", "word": "hi"])
+    assert_eq(res.status, 200)
+    assert_eq(res.body, "{\"id\":7,\"flag\":true,\"word\":\"hi\"}")
+    let bare = ask(fx, "GET", "/echo/7")
+    assert_eq(bare.body, "{\"id\":7,\"flag\":null,\"word\":\"\"}")
+}
+
+test "a parameter that doesn't convert is a 400 that says why" {
+    let fx = fixture()
+    let id = ask(fx, "GET", "/echo/seven")
+    assert_eq(id.status, 400)
+    assert(id.body.contains("the id in the path must be a number, not seven"))
+    let flag = ask(fx, "GET", "/echo/7", ["flag": "maybe"])
+    assert_eq(flag.status, 400)
+    assert(flag.body.contains("?flag= takes true or false, not maybe"))
+}
+
+test "a body is read into its struct, and context values are handed over" {
+    let fx = fixture()
+    let res = ask(fx, "POST", "/count", body: "{\"name\":\"ada\"}")
+    assert_eq(res.status, 201)
+    assert_eq(res.headers["location"], "/count/1")
+    assert_eq(res.body, "{\"name\":\"ada\"}")
+    assert_eq(fx.counter.n, 1)
+}
+
+test "a body that is missing or the wrong shape is a 400" {
+    let fx = fixture()
+    let empty = ask(fx, "POST", "/count")
+    assert_eq(empty.status, 400)
+    assert(empty.body.contains("a JSON body is required"))
+    let wrong = ask(fx, "POST", "/count", body: "{\"name\":3}")
+    assert_eq(wrong.status, 400)
+    assert(wrong.body.contains("name"))
+    assert_eq(fx.counter.n, 0)
+}
+
+test "none from a -> None handler is a 204, and an ApiError keeps its status" {
+    let fx = fixture()
+    let missing = ask(fx, "DELETE", "/count")
+    assert_eq(missing.status, 404)
+    assert_eq(missing.body, "{\"error\":\"not_found\",\"message\":\"nothing to reset\"}")
+    ask(fx, "POST", "/count", body: "{\"name\":\"ada\"}")
+    let done = ask(fx, "DELETE", "/count")
+    assert_eq(done.status, 204)
+    assert_eq(done.body, "")
+    assert_eq(fx.counter.n, 0)
+}
+
+test "anything else a handler throws is a 500" {
+    let res = ask(fixture(), "GET", "/broken")
+    assert_eq(res.status, 500)
+    assert(res.body.contains("internal"))
+}
+
+test "a Response from a handler goes out as it is" {
+    let res = ask(fixture(), "GET", "/page")
+    assert_eq(res.headers["content-type"], "text/html; charset=utf-8")
+    assert_eq(res.body, "<p>hi</p>")
+}
+
+test "handlers that can't be mounted are a SetupError" {
+    let no_route = assert_throws(fn() { mount(Api.new("t", "1"), [undecorated]) })
+    assert(no_route.message().contains("no @get"))
+    let no_value = assert_throws(fn() { mount(Api.new("t", "1"), [needs_a_store]) })
+    assert(no_value.message().contains("nothing to pass as store"))
+    let no_id = assert_throws(fn() { mount(Api.new("t", "1"), [forgets_the_id]) })
+    assert(no_id.message().contains("{id}"))
+}
+
+test "named and argument read a TypeRef" {
+    let sig = reflect.signature(echo)
+    assert_eq(named(sig.params[0].type), Number)
+    assert_eq(named(sig.params[1].type), Option)
+    assert_eq(named(argument(sig.params[1].type, 0)), Bool)
+    assert(optional(sig.params[1].type))
+    assert(!optional(sig.params[0].type))
+    assert_eq(named(reflect.signature(bump).returns), Created)
+    assert_eq(named(reflect.signature(reset).returns), None)
+}

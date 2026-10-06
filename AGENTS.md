@@ -14,6 +14,11 @@ what doesn't (no tuples, no string interpolation, ...).
 | `mah-project.toml` | project manifest: name, version, entry point, build targets |
 | `src/` | Mah source files |
 | `src/main.mh` | entry point (the `entry` in the manifest); top-level code runs top to bottom |
+| `src/api.mh` | the routes: decorated functions (`@get("/todos")`, `@path id: Number`, ...) |
+| `src/rest.mh` | turns those functions into routes with `std:reflect` (binding, errors, answers) |
+| `src/openapi.mh` | the OpenAPI document at `/openapi.json`, written from the same declarations |
+| `src/http.mh` | the HTTP server side over `std:socket` (`std:http` is only a client) |
+| `src/web.mh` | the browser pages: the todo list at `/`, Swagger UI at `/docs` |
 | `src/*.test.mh` | tests, run by `mah test` (`src/main.test.mh` tests `src/main.mh`) |
 | `docs/mah-language.md` | the complete Mah language reference |
 | `build/` | compiled output from `mah build` (git-ignored) |
@@ -46,6 +51,11 @@ before anything runs. A runtime error stops the program and says where it
 happened, `at position #LINE:COL` (or `file.mh#LINE:COL` inside an imported
 file; an error from inside the standard library is reported at your call to
 it).
+
+To add a route, write a function in `src/api.mh` with a `##` doc, a route
+decorator, typed parameters and a return type: it is served and documented
+from that alone. Rebuild `out/todo.mahc` (`mah build --target release`, then
+copy `build/todo.mahc`) when the Dockerfiles should ship the change.
 
 Check your changes with `mah test`. Tests live in `*.test.mh` files next to
 the code they test: `test "name" { ... }` blocks using `assert`/`assert_eq`/
@@ -81,7 +91,7 @@ test with every change, and make sure `mah test` passes.
   file. The standard library is imported the same
   way, as `"std:<name>"`: `std:math`, `std:path`, `std:json`, `std:csv`,
   `std:random`, `std:collections`, `std:regex`, `std:time`, `std:async`,
-  `std:bytes` (the mutable `Bytes` type's helpers), `std:fs`, `std:process`, `std:socket` (TCP clients and servers), `std:reflect` (types, `##` docs, decorators and their hooks at run time,
+  `std:bytes` (the mutable `Bytes` type's helpers), `std:fs`, `std:process`, `std:socket` (TCP clients and servers, TLS clients), `std:url`, `std:http` (an HTTP/HTTPS client), `std:reflect` (types, `##` docs, decorators and their hooks at run time,
   which `json.decode` uses to read JSON into your structs) and `std:test` for
   tests (see `docs/mah-language.md`).
 - Model data with `struct`/`enum` + `match`, and give behavior to types with

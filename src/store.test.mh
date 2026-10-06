@@ -79,3 +79,14 @@ test "clear empties the list but not the ids" {
     assert_eq(db.len(), 0)
     assert_eq(db.add("two").id, 2)
 }
+
+test "remove_done drops only the finished ones" {
+    let db = Store.new()
+    db.add("one")
+    db.add("two", true)
+    db.add("three", true)
+    assert_eq(db.remove_done(), 2)
+    assert_eq(db.len(), 1)
+    assert_eq(db.all()[0].title, "one")
+    assert_eq(db.remove_done(), 0)
+}

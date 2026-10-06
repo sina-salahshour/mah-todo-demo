@@ -4,6 +4,7 @@ import process from "std:process"
 import socket from "std:socket"
 import api from "./api"
 import http from "./http"
+import rest from "./rest"
 import store from "./store"
 
 ## Where to listen. `PORT` and `HOST` in the environment win over the
@@ -84,10 +85,15 @@ export fn config_from_args(args: Vector<String>) throws ConfigError {
 ## until serve runs. When the port asked for is already taken the next one is
 ## tried, and the one after that, so a second copy of the program starts
 ## alongside the first instead of giving up; `tries` is how far up it will go.
-## Throws socket.SocketError for any other reason (a host that won't bind, no
+## Throws rest.SetupError when a route can't be mounted (a bug, not bad
+## luck), and socket.SocketError for any other reason (a host that won't bind, no
 ## free port within `tries`). Port 0 asks the system for a free port, which
 ## `Server.port` then reports.
-export fn start(config: Config, db: store.Store, tries: Number = 100) throws socket.SocketError {
+export fn start(
+    config: Config,
+    db: store.Store,
+    tries: Number = 100
+) throws socket.SocketError | rest.SetupError {
     let port = config.port
     let left = tries
     while true {

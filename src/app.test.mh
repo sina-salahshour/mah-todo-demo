@@ -1,4 +1,5 @@
 import "std:test"
+import http from "std:http"
 import process from "std:process"
 import socket from "std:socket"
 import "./app"
@@ -137,4 +138,69 @@ test "no free port within reach is a SocketError" {
     )
     assert_eq(e.kind, "address_in_use")
     first.stop()
+}
+
+## Calls `body` with a server on a free port answering in the background,
+## then stops it and waits for it to wind down. The std:http client (`http`
+## here) is pointed around any proxy the environment names.
+fn with_server(body: fn(Server)) {
+    process.env_set("NO_PROXY", "127.0.0.1,localhost")
+    let server = start(Config { host: "127.0.0.1", port: 0 }, Store.new())
+    let task = detach serve(server)
+    defer {
+        server.stop()
+        task.await
+    }
+    body(server)
+}
+
+test "a real client can use the whole api over the wire" {
+    with_server(fn(server: Server) {
+        let base = server.url()
+
+        let created = http.post(base + "/todos", json: ["title": "  wash up "])
+        assert_eq(created.status, 201)
+        assert_eq(created.header("Location"), "/todos/1")
+        assert_eq(created.json()["title"], "wash up")
+        http.post(base + "/todos", json: ["title": "dry up", "done": true])
+
+        let open = http.get(base + "/todos?done=false").json()
+        assert_eq(open["count"], 1)
+        assert_eq(open["todos"][0]["title"], "wash up")
+
+        let patched = http.patch(base + "/todos/1", json: ["done": true])
+        assert_eq(patched.json()["done"], true)
+
+        let cleared = http.delete(base + "/todos/done")
+        assert_eq(cleared.json()["removed"], 2)
+        assert_eq(http.get(base + "/todos").json()["count"], 0)
+
+        let gone = http.get(base + "/todos/1")
+        assert_eq(gone.status, 404)
+        assert_eq(gone.json()["error"], "not_found")
+        assert(server.requests >= 7)
+    })
+}
+
+test "the browser pages and the openapi document come over the wire" {
+    with_server(fn(server: Server) {
+        let home = http.get(server.url() + "/")
+        assert_eq(home.status, 200)
+        assert(home.header("content-type").starts_with("text/html"))
+        assert(home.text().contains("href='/docs'"))
+        let docs = http.get(server.url() + "/docs").check_status()
+        assert(docs.text().contains("SwaggerUIBundle"))
+        let spec = http.get(server.url() + "/openapi.json").json()
+        assert_eq(spec["info"]["title"], "p05 todo api")
+    })
+}
+
+test "a request that isn't http is a 400" {
+    with_server(fn(server: Server) {
+        let conn = socket.connect("127.0.0.1", server.port())
+        conn.send_text("hello there\r\n\r\n")
+        let line = conn.read_line(5000)
+        conn.close()
+        assert_eq(line, "HTTP/1.1 400 Bad Request")
+    })
 }

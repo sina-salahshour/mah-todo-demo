@@ -1,176 +1,229 @@
-# The todo API: every route the server answers, JSON in and JSON out. The
-# routes are built here, the connection handling is src/app.mh's job, and the
-# todos live in a store.Store this module is handed.
-import json from "std:json"
+# The todo API: every route the server answers, JSON in and JSON out. Each
+# route is a plain function whose decorators (see src/rest.mh) say its method
+# and path; its `##` doc, its typed parameters and its return type are read
+# with std:reflect, both to serve it and to describe it in the OpenAPI
+# document at /openapi.json (src/openapi.mh), which /docs shows in Swagger UI.
+# The connection handling is src/app.mh's job, and the todos live in a
+# store.Store this module is handed.
+import "./rest.mh"
 import http from "./http"
+import openapi from "./openapi"
 import store from "./store"
 import web from "./web"
 
-## The body POST /todos and PUT /todos/{id} take: a title, and a done flag that
-## defaults to false when it isn't there.
-struct NewTodo { title: String, done: Option<Bool> }
+## The API's version, as the OpenAPI document gives it.
+export let version = "0.2.0"
 
-## The body PATCH /todos/{id} takes: whichever of the two fields are there.
-struct TodoPatch { title: Option<String>, done: Option<Bool> }
-
-## The answer to GET /todos: how many came back, and which.
-struct TodoList { count: Number, todos: Vector<store.Todo> }
-
-## The answer to GET /api: what this is, how much is in it, and where to go.
-struct Index { service: String, todos: Number, routes: Vector<String> }
-
-## The answer to GET /health.
-struct Health { status: String, todos: Number }
-
-## `some(true)` or `some(false)` for a `?done=...`, none when the query doesn't
-## ask for one. Throws HttpError on any other value.
-fn done_filter(query: Map<String, String>) throws http.HttpError {
-    if !query.has("done") { return none }
-    let raw = query["done"]
-    if raw == "true" { return some(true) }
-    if raw == "false" { return some(false) }
-    throw http.HttpError.BadRequest { message: "?done= takes true or false, not " + raw }
+## A todo to add, or the whole of one to put in place of another.
+struct NewTodo {
+    ## What needs doing. Surrounding whitespace is dropped; it can't be blank.
+    @example("buy milk") title: String,
+    ## Whether it is already finished (false when left out).
+    @example(false) done: Option<Bool>
 }
 
-## The `{id}` of a path as a Number; throws HttpError when it isn't one.
-fn require_id(params: Map<String, String>) throws http.HttpError {
-    let raw = if params.has("id") { params["id"] } else { "" }
-    let id = raw.parse_number()
-    if id == none {
-        throw http.HttpError.BadRequest {
-            message: "the id in the path must be a number, not " + raw
-        }
+## The fields of a todo to change; leave out the ones to keep.
+struct TodoPatch {
+    ## A new title. Surrounding whitespace is dropped; it can't be blank.
+    @example("buy oat milk") title: Option<String>,
+    ## Finished or not.
+    @example(true) done: Option<Bool>
+}
+
+## Some todos, and how many there are.
+struct TodoList {
+    ## How many todos `todos` holds.
+    @example(1) count: Number,
+    todos: Vector<store.Todo>
+}
+
+## How many todos `DELETE /todos/done` removed.
+struct Cleared {
+    @example(2) removed: Number
+}
+
+## What this service is and where to go next.
+struct Index {
+    @example("todo api") service: String,
+    ## The API version.
+    version: String,
+    ## How many todos there are now.
+    todos: Number,
+    ## Swagger UI, for a browser.
+    @example("/docs") docs: String,
+    ## The OpenAPI document.
+    @example("/openapi.json") openapi: String,
+    ## Every route, as `METHOD /path`.
+    routes: Vector<String>
+}
+
+## Whether the service is up.
+struct Health {
+    @example("ok") status: String,
+    ## How many todos there are now.
+    todos: Number
+}
+
+## The title of a NewTodo or a patch, trimmed; throws a 422 when it is blank.
+fn checked_title(title: String) -> String throws ApiError {
+    let trimmed = title.trim()
+    if trimmed == "" { throw unprocessable("invalid_todo", "title must not be empty") }
+    trimmed
+}
+
+## A 404 for the todo `id`.
+fn missing(id: Number) -> ApiError { not_found("there is no todo " + id) }
+
+# -- pages ----------------------------------------------------------------------
+
+## The todo list, for a browser.
+@get("/", listed: false)
+fn home() -> http.Response { http.Response.html(web.page()) }
+
+## Swagger UI over /openapi.json.
+@get("/docs", listed: false)
+fn docs() -> http.Response { http.Response.html(web.docs_page()) }
+
+# -- about the service --------------------------------------------------------
+
+## Describe the service.
+##
+## Its name, version, size, and every route it answers.
+@get("/api", tags: ["service"])
+fn index(db: store.Store, api: Api) -> Index {
+    Index {
+        service: "todo api",
+        version: version,
+        todos: db.len(),
+        docs: "/docs",
+        openapi: "/openapi.json",
+        routes: api.router.describe()
     }
-    id
 }
 
-## What a 404 for a todo that isn't there says.
-fn missing(id: Number) -> http.Response {
-    http.Response.error(404, "not_found", "there is no todo " + id)
+## Check that the service is up.
+@get("/health", tags: ["service"])
+fn health(db: store.Store) -> Health { Health { status: "ok", todos: db.len() } }
+
+## This document.
+##
+## Written at run time from the handlers' declarations with std:reflect.
+@get("/openapi.json", tags: ["service"])
+fn openapi_json(api: Api) -> Map<String, Unknown> { openapi.document(api) }
+
+# -- todos --------------------------------------------------------------------
+
+## List todos.
+##
+## Oldest first. `?done=true` leaves only the finished ones, `?done=false`
+## only the open ones.
+@get("/todos", tags: ["todos"])
+fn list_todos(
+    db: store.Store,
+    ## Only finished (true) or only open (false) todos.
+    @query done: Option<Bool>
+) -> TodoList {
+    let todos = db.all(done)
+    TodoList { count: todos.len(), todos: todos }
 }
 
-## The trimmed title of a `NewTodo`, or a 422 when it is only whitespace.
-fn checked_title(input: NewTodo) -> Option<String> {
-    let title = input.title.trim()
-    if title == "" { return none }
-    some(title)
+## Add a todo.
+@post("/todos", errors: [422], tags: ["todos"])
+fn create_todo(db: store.Store, @body input: NewTodo) -> Created<store.Todo> {
+    let todo = db.add(checked_title(input.title), input.done.unwrap_or(false))
+    Created { value: todo, location: "/todos/" + todo.id }
+}
+
+## Remove every finished todo.
+##
+## Declared before `/todos/{id}`, which would otherwise take `done` for an id.
+@delete("/todos/done", tags: ["todos"])
+fn clear_done(db: store.Store) -> Cleared { Cleared { removed: db.remove_done() } }
+
+## Get one todo.
+@get("/todos/{id}", errors: [404], tags: ["todos"])
+fn get_todo(
+    db: store.Store,
+    ## The todo's id.
+    @path id: Number
+) -> store.Todo {
+    let todo = db.get(id)
+    if todo == none { throw missing(id) }
+    todo.unwrap()
+}
+
+## Replace a todo.
+##
+## The title and the done flag both come from the body; a done flag left out
+## is false.
+@put("/todos/{id}", errors: [404, 422], tags: ["todos"])
+fn replace_todo(
+    db: store.Store,
+    ## The todo's id.
+    @path id: Number,
+    @body input: NewTodo
+) -> store.Todo {
+    let title = checked_title(input.title)
+    let todo = db.replace(id, title, input.done.unwrap_or(false))
+    if todo == none { throw missing(id) }
+    todo.unwrap()
+}
+
+## Change part of a todo.
+##
+## Only the fields in the body change. A body with neither is a 422.
+@patch("/todos/{id}", errors: [404, 422], tags: ["todos"])
+fn update_todo(
+    db: store.Store,
+    ## The todo's id.
+    @path id: Number,
+    @body input: TodoPatch
+) -> store.Todo {
+    if input.title == none & input.done == none {
+        throw unprocessable("invalid_patch", "give a title, a done flag, or both")
+    }
+    let todo = db.get(id)
+    if todo == none { throw missing(id) }
+    let one = todo.unwrap()
+    let title = if input.title == none { one.title } else { checked_title(input.title.unwrap()) }
+    let done = if input.done == none { one.done } else { input.done.unwrap() }
+    db.replace(id, title, done).unwrap()
+}
+
+## Flip a todo between open and finished.
+@post("/todos/{id}/toggle", errors: [404], tags: ["todos"])
+fn toggle_todo(
+    db: store.Store,
+    ## The todo's id.
+    @path id: Number
+) -> store.Todo {
+    let todo = db.toggle(id)
+    if todo == none { throw missing(id) }
+    todo.unwrap()
+}
+
+## Delete a todo.
+@delete("/todos/{id}", errors: [404], tags: ["todos"])
+fn delete_todo(
+    db: store.Store,
+    ## The todo's id.
+    @path id: Number
+) -> None {
+    if !db.remove(id) { throw missing(id) }
+}
+
+## The described API over `db`: its router answers every route above.
+export fn describe(db: store.Store) -> Api throws SetupError {
+    let api = Api.new(
+        "p05 todo api",
+        version,
+        "A todo list kept in memory by a server written in Mah. Every route is a plain function; this document is written from their declarations with std:reflect."
+    )
+    api.tag("todos", "The todo list itself")
+    api.tag("service", "About the service")
+    mount(api, registered(), [db])
+    api
 }
 
 ## The routes of the todo API, all reading and writing `db`.
-export fn build(db: store.Store) -> http.Router {
-    let router = http.Router.new()
-
-    # The page for a browser. Everything it does goes through the routes below,
-    # so there is one API, not two.
-    router.get("/", fn(req: http.Request, params: Map<String, String>) -> http.Response {
-        http.Response.html(web.page())
-    })
-
-    router.get("/api", fn(req: http.Request, params: Map<String, String>) -> http.Response {
-        http.Response.json(
-            Index { service: "todo api", todos: db.len(), routes: router.describe() }
-        )
-    })
-
-    router.get("/health", fn(req: http.Request, params: Map<String, String>) -> http.Response {
-        http.Response.json(Health { status: "ok", todos: db.len() })
-    })
-
-    router.get("/todos", fn(req: http.Request, params: Map<String, String>) -> http.Response {
-        let done = try { done_filter(req.query) } catch {
-            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        let todos = db.all(done)
-        http.Response.json(TodoList { count: todos.len(), todos: todos })
-    })
-
-    router.post("/todos", fn(req: http.Request, params: Map<String, String>) -> http.Response {
-        if req.body.trim() == "" {
-            return http.Response.error(400, "bad_request", "a JSON body is required")
-        }
-        let input = try { json.parse_as(NewTodo, req.body) } catch {
-            e: json.JsonError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        let title = checked_title(input)
-        if title == none {
-            return http.Response.error(422, "invalid_todo", "title must not be empty")
-        }
-        let todo = db.add(title.unwrap_or(""), input.done.unwrap_or(false))
-        let res = http.Response.json(todo, 201)
-        res.headers["location"] = "/todos/" + todo.id
-        res
-    })
-
-    router.get("/todos/{id}", fn(req: http.Request, params: Map<String, String>) -> http.Response {
-        let id = try { require_id(params) } catch {
-            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        let todo = db.get(id)
-        if todo == none { return missing(id) }
-        http.Response.json(todo.unwrap())
-    })
-
-    router.put("/todos/{id}", fn(req: http.Request, params: Map<String, String>) -> http.Response {
-        let id = try { require_id(params) } catch {
-            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        let input = try { json.parse_as(NewTodo, req.body) } catch {
-            e: json.JsonError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        let title = checked_title(input)
-        if title == none {
-            return http.Response.error(422, "invalid_todo", "title must not be empty")
-        }
-        let todo = db.replace(id, title.unwrap_or(""), input.done.unwrap_or(false))
-        if todo == none { return missing(id) }
-        http.Response.json(todo)
-    })
-
-    router.patch("/todos/{id}", fn(
-        req: http.Request,
-        params: Map<String, String>
-    ) -> http.Response {
-        let id = try { require_id(params) } catch {
-            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        let input = try { json.parse_as(TodoPatch, req.body) } catch {
-            e: json.JsonError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        if input.title == none & input.done == none {
-            return http.Response.error(422, "invalid_patch", "give a title, a done flag, or both")
-        }
-        let todo = db.get(id)
-        if todo == none { return missing(id) }
-        let one = todo.unwrap()
-        let title = if input.title == none { one.title } else { input.title.unwrap_or("").trim() }
-        let done = if input.done == none { one.done } else { input.done.unwrap_or(false) }
-        let updated = db.replace(id, title, done)
-        if updated == none { return missing(id) }
-        http.Response.json(updated.unwrap())
-    })
-
-    router.post("/todos/{id}/toggle", fn(
-        req: http.Request,
-        params: Map<String, String>
-    ) -> http.Response {
-        let id = try { require_id(params) } catch {
-            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        let todo = db.toggle(id)
-        if todo == none { return missing(id) }
-        http.Response.json(todo)
-    })
-
-    router.delete("/todos/{id}", fn(
-        req: http.Request,
-        params: Map<String, String>
-    ) -> http.Response {
-        let id = try { require_id(params) } catch {
-            e: http.HttpError => { return http.Response.error(400, "bad_request", e.message()) }
-        }
-        if !db.remove(id) { return missing(id) }
-        http.Response.empty(204)
-    })
-
-    router
-}
+export fn build(db: store.Store) -> http.Router throws SetupError { describe(db).router }

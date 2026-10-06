@@ -23,7 +23,8 @@ test "the page talks to the json api over fetch" {
         "call('POST', '/todos'",
         "call('GET', '/todos'",
         "call('PATCH', '/todos/'",
-        "call('DELETE', '/todos/'"
+        "call('DELETE', '/todos/'",
+        "call('DELETE', '/todos/done'"
     ] {
         assert(page.contains(call), "the page should send " + call)
     }
@@ -33,4 +34,19 @@ test "the page carries no outside script or style" {
     let page = web.page()
     assert(!page.contains("http://") & !page.contains("https://"))
     assert(!page.contains("<script src="))
+}
+
+test "the page links to the api docs" {
+    let page = web.page()
+    assert(page.contains("href='/docs'"))
+    assert(page.contains("href='/openapi.json'"))
+}
+
+test "the docs page is swagger ui over /openapi.json, with a way back" {
+    let page = web.docs_page()
+    assert(page.starts_with("<!doctype html>"))
+    assert(page.contains("swagger-ui-bundle.js"))
+    assert(page.contains("swagger-ui.css"))
+    assert(page.contains("url: '/openapi.json'"))
+    assert(page.contains("href='/'"))
 }

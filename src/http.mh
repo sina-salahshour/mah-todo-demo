@@ -2,14 +2,18 @@
 # connection, write one response back, and send a path to a handler.
 #
 # Deliberately narrow: one request per connection (the response always says
-# `Connection: close`), bodies only with a Content-Length, no chunked encoding,
-# no keep-alive and no percent-decoding. Nothing in here knows about todos --
-# that is src/api.mh's job.
+# `Connection: close`), bodies only with a Content-Length, no chunked encoding
+# and no keep-alive. Query strings and path segments are percent-decoded with
+# std:url. Nothing in here knows about todos -- that is src/api.mh's job, and
+# turning functions into routes is src/rest.mh's.
+#
+# The standard library's std:http is a *client*; this file is the server side.
 # std:json is imported under another name on purpose: a method called `json`
 # (Response.json below) and a module called `json` in the same file trip up the
 # compiler's type resolution, and this file wants both.
 import jsonlib from "std:json"
 import socket from "std:socket"
+import url from "std:url"
 
 ## The most a request body may hold, in bytes.
 export let max_body = 65536
@@ -58,8 +62,16 @@ export struct Route {
 ## The routes of one server, tried in the order they were added.
 export struct Router { routes: Vector<Route> }
 
+## The body of every error answer.
+export struct ErrorBody {
+    ## A short code a program can test, like `not_found` or `bad_request`.
+    error: String,
+    ## What went wrong, in words.
+    message: String
+}
+
 ## The reason phrase to put after a status code.
-fn reason(status: Number) -> String {
+export fn reason(status: Number) -> String {
     match status {
         200 => { "OK" }
         201 => { "Created" }
@@ -79,29 +91,27 @@ fn reason(status: Number) -> String {
     }
 }
 
-## Everything after the `?` of `target`, split on `&` then `=`. Values are kept
-## exactly as they were sent: nothing is percent-decoded.
-fn parse_query(target: String) -> Map<String, String> {
+## Everything after the `?` of `target`, decoded by std:url (`+` is a space,
+## `%20` too); when a key comes twice the last one wins. Throws HttpError for
+## a bad `%` escape.
+export fn parse_query(target: String) -> Map<String, String> throws HttpError {
     let out = [:]
     let mark = target.index_of("?")
     if mark == none { return out }
-    let query = target[(mark.unwrap() + 1)..]
-    if query == "" { return out }
-    for let pair in query.split("&") {
-        if pair == "" { continue }
-        let eq = pair.index_of("=")
-        if eq == none {
-            out[pair] = ""
-        } else {
-            let at = eq.unwrap()
-            out[pair[..at]] = pair[(at + 1)..]
+    let pairs = try { url.parse_query(target[(mark.unwrap() + 1)..]) } catch {
+        e: url.UrlError => {
+            throw HttpError.BadRequest { message: "a bad query string: " + e.description }
         }
+    }
+    for let pair in pairs {
+        if pair[0] != "" { out[pair[0]] = pair[1] }
     }
     out
 }
 
-## The path part of `target`: everything before its `?`.
-fn target_path(target: String) -> String {
+## The path part of `target`: everything before its `?`, still encoded (so an
+## escaped `/` can't add a segment; path_match decodes each one).
+export fn target_path(target: String) -> String {
     let mark = target.index_of("?")
     if mark == none { target } else { target[..mark.unwrap()] }
 }
@@ -124,7 +134,7 @@ fn path_match(pattern: String, path: String) -> Option<Map<String, String>> {
     for let i in 0..wanted.len() {
         let part = wanted[i]
         if part.starts_with("{") & part.ends_with("}") {
-            params[part[1..part.len() - 1]] = got[i]
+            params[part[1..part.len() - 1]] = try url.decode(got[i]) else got[i]
         } elif part != got[i] {
             return none
         }
@@ -269,9 +279,9 @@ impl Response {
     ## A status with no body at all.
     fn empty(status: Number) -> Response { Response.new(status, "") }
 
-    ## `{"error": code, "message": message}` with the given status.
+    ## An ErrorBody, `{"error": code, "message": message}`, with the given status.
     fn error(status: Number, code: String, message: String) -> Response {
-        Response.json(["error": code, "message": message], status)
+        Response.json(ErrorBody { error: code, message: message }, status)
     }
 }
 

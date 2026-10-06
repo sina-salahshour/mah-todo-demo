@@ -12,36 +12,21 @@ fn fixture() -> Fixture {
     Fixture { db: db, router: build(db) }
 }
 
-## The `?a=1&b=2` of a request target, as a map.
-fn query_of(target: String) -> Map<String, String> {
-    let out = [:]
-    let at = target.index_of("?")
-    if at == none { return out }
-    for let pair in target[(at.unwrap() + 1)..].split("&") {
-        if pair == "" { continue }
-        let eq = pair.index_of("=")
-        if eq == none {
-            out[pair] = ""
-        } else {
-            out[pair[..eq.unwrap()]] = pair[(eq.unwrap() + 1)..]
-        }
-    }
-    out
-}
-
 ## Asks `router` for `target` and gives back the response, the way the wire
-## would: the path without the query, the query in a map of its own.
+## would: the path without the query, the query decoded into a map of its
+## own (by http.mh's own parse_query, which uses std:url).
 fn ask(fx: Fixture, method: String, target: String, body: String = "") -> Response {
-    let at = target.index_of("?")
     let headers = [:]
     if body != "" { headers["content-length"] = body.len().to_string() }
-    fx.router.dispatch(Request {
-        method: method.to_upper(),
-        path: if at == none { target } else { target[..at.unwrap()] },
-        query: query_of(target),
-        headers: headers,
-        body: body
-    })
+    fx.router.dispatch(
+        Request {
+            method: method.to_upper(),
+            path: target_path(target),
+            query: parse_query(target),
+            headers: headers,
+            body: body
+        }
+    )
 }
 
 ## The todo a JSON response carries, as the fields worth checking.
@@ -63,6 +48,31 @@ test "the root is the page, and /api describes the service" {
     assert_eq(index.headers["content-type"], "application/json; charset=utf-8")
     assert(index.body.contains("\"service\":\"todo api\""))
     assert(index.body.contains("GET /todos/{id}"))
+    assert(index.body.contains("\"docs\":\"/docs\""))
+}
+
+test "/docs is swagger ui and /openapi.json the document it shows" {
+    let fx = fixture()
+    let docs = ask(fx, "GET", "/docs")
+    assert_eq(docs.status, 200)
+    assert(docs.body.contains("SwaggerUIBundle"))
+    let spec = ask(fx, "GET", "/openapi.json")
+    assert_eq(spec.status, 200)
+    assert_eq(spec.headers["content-type"], "application/json; charset=utf-8")
+    let doc = json.parse(spec.body)
+    assert_eq(doc["openapi"], "3.0.3")
+    assert(doc["paths"].has("/todos/{id}"))
+}
+
+test "clearing done todos leaves the open ones" {
+    let fx = fixture()
+    fx.db.add("one")
+    fx.db.add("two", true)
+    let res = ask(fx, "DELETE", "/todos/done")
+    assert_eq(res.status, 200)
+    assert_eq(res.body, "{\"removed\":1}")
+    assert_eq(fx.db.len(), 1)
+    assert_eq(fx.db.all()[0].title, "one")
 }
 
 test "health counts what is in the list" {
@@ -117,6 +127,7 @@ test "listing gives the count and every todo" {
     assert(open.body.contains("one"))
     assert(!open.body.contains("two"))
     assert_eq(ask(fx, "GET", "/todos?done=maybe").status, 400)
+    assert_eq(ask(fx, "GET", "/todos?done=%74rue").body.contains("\"count\":1"), true)
 }
 
 test "one todo by id, or a 404" {

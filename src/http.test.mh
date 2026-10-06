@@ -20,13 +20,22 @@ test "a target splits into a path and a query" {
     assert_eq(target_path("/todos?"), "/todos")
 }
 
-test "the query is a map, with nothing decoded" {
+test "the query is a map, decoded" {
     assert_eq(parse_query("/todos").len(), 0)
     assert_eq(parse_query("/todos?").len(), 0)
     assert_eq(parse_query("/todos?a=1&b=2")["a"], "1")
     assert_eq(parse_query("/todos?a=1&a=3")["a"], "3")
     assert_eq(parse_query("/todos?flag")["flag"], "")
-    assert_eq(parse_query("/todos?q=a%20b")["q"], "a%20b")
+    assert_eq(parse_query("/todos?q=a%20b")["q"], "a b")
+    assert_eq(parse_query("/todos?q=a+b%26c")["q"], "a b&c")
+}
+
+test "a bad escape in the query is an HttpError" {
+    assert_throws(fn() { parse_query("/todos?q=%zz") })
+}
+
+test "path parameters are decoded" {
+    assert_eq(path_match("/tags/{name}", "/tags/two%20words").unwrap()["name"], "two words")
 }
 
 test "segments drops a trailing slash and keeps an empty root" {
@@ -117,4 +126,3 @@ test "describe lists every route in the order it was added" {
     assert_eq(routes[0], "GET /todos")
     assert_eq(routes[2], "GET /todos/{id}")
 }
-

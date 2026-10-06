@@ -1,0 +1,287 @@
+# An OpenAPI 3.0 document for a rest.Api, written entirely from what
+# std:reflect says about the mounted handlers: the `##` doc of each function
+# is its summary and description, its `@path`/`@query`/`@body` parameters
+# (and their `##` docs) are the parameters and request body, its return type
+# is the response, and every struct those types name becomes a schema under
+# `components`, with its fields, their docs and `@example`s. Nothing here is
+# written by hand per route, so the document can't drift from the code.
+import reflect from "std:reflect"
+import http from "./http"
+import rest from "./rest"
+
+## The schemas collected while writing the document, by name, in the order
+## they were first met.
+struct Components { schemas: Map<String, Unknown> }
+
+fn object() -> Map<String, Unknown> { [:] }
+
+fn typed(name: String) -> Map<String, Unknown> {
+    let out = object()
+    out["type"] = name
+    out
+}
+
+fn reference(name: String) -> Map<String, Unknown> {
+    let out = object()
+    out["$ref"] = "#/components/schemas/" + name
+    out
+}
+
+## The first line of a `##` doc, and everything after it.
+fn summary_of(doc: String) -> String { doc.trim().lines()[0] }
+
+fn details_of(doc: String) -> String {
+    let lines = doc.trim().lines()
+    if lines.len() < 2 { return "" }
+    lines[1..].join("\n").trim()
+}
+
+impl Components {
+    ## A JSON Schema for a value of type `t`. A struct or enum is written once,
+    ## into `schemas`, and referred to by name.
+    fn schema_of(self, t: reflect.TypeRef) -> Map<String, Unknown> {
+        let kind = rest.named(t)
+        if kind == none { return object() }
+        if kind == Number { return typed("number") }
+        if kind == String { return typed("string") }
+        if kind == Bool { return typed("boolean") }
+        if kind == Option {
+            let inner = self.schema_of(rest.argument(t, 0))
+            if inner.has("$ref") {
+                # a $ref can't carry siblings in OpenAPI 3.0
+                let wrapped = object()
+                wrapped["allOf"] = [inner]
+                wrapped["nullable"] = true
+                return wrapped
+            }
+            inner["nullable"] = true
+            return inner
+        }
+        if kind == Vector {
+            let out = typed("array")
+            out["items"] = self.schema_of(rest.argument(t, 0))
+            return out
+        }
+        if kind == Map {
+            let out = typed("object")
+            out["additionalProperties"] = self.schema_of(rest.argument(t, 1))
+            return out
+        }
+        if kind == rest.Created { return self.schema_of(rest.argument(t, 0)) }
+        let name = "" + kind
+        if !self.schemas.has(name) {
+            self.schemas[name] = object()
+            self.schemas[name] = self.declared(kind)
+        }
+        reference(name)
+    }
+
+    ## The properties and required list of some fields.
+    fn fields_schema(self, fields: Vector<reflect.Field>) -> Map<String, Unknown> {
+        let out = typed("object")
+        let properties = object()
+        let required = []
+        for let field in fields {
+            let one = self.schema_of(field.type)
+            if field.doc != "" { one["description"] = field.doc.trim() }
+            let example = reflect.find(field.decorators, rest.Example)
+            if example != none { one["example"] = example.unwrap().value }
+            properties[field.name] = one
+            if !rest.optional(field.type) { required.push(field.name) }
+        }
+        out["properties"] = properties
+        if required.len() > 0 { out["required"] = required }
+        out
+    }
+
+    ## The schema of a declared struct or enum. An enum of unit variants is a
+    ## string; one with fields is each variant the way std:json writes it,
+    ## `{"Variant": {fields}}`.
+    fn declared(self, kind: Type<Unknown>) -> Map<String, Unknown> {
+        match reflect.schema(kind) {
+            some(
+                reflect.Schema.Struct {
+                    type: _,
+                    doc: doc,
+                    type_params: _,
+                    fields: fields,
+                    decorators: _
+                }
+            ) => {
+                let out = self.fields_schema(fields)
+                if doc != "" { out["description"] = doc.trim() }
+                out
+            }
+            some(
+                reflect.Schema.Enum {
+                    type: _,
+                    doc: doc,
+                    type_params: _,
+                    variants: variants,
+                    decorators: _
+                }
+            ) => {
+                let plain = variants.reduce(fn(all, v) { all & v.fields.len() == 0 }, true)
+                let out = if plain {
+                    let names = typed("string")
+                    names["enum"] = variants.map(fn(v) { v.name }).reduce()
+                    names
+                } else {
+                    let choices = []
+                    for let v in variants {
+                        let one = typed("object")
+                        let props = object()
+                        props[v.name] = self.fields_schema(v.fields)
+                        one["properties"] = props
+                        one["required"] = [v.name]
+                        choices.push(one)
+                    }
+                    let either = object()
+                    either["oneOf"] = choices
+                    either
+                }
+                if doc != "" { out["description"] = doc.trim() }
+                out
+            }
+            _ => { object() }
+        }
+    }
+}
+
+## `content` for a JSON body of the given schema.
+fn json_content(schema: Map<String, Unknown>) -> Map<String, Unknown> {
+    let media = object()
+    media["schema"] = schema
+    let out = object()
+    out["application/json"] = media
+    out
+}
+
+## A TypeRef for a plain type.
+fn type_ref(t: Type<Unknown>) -> reflect.TypeRef { reflect.TypeRef.Named { type: t, args: [] } }
+
+fn error_response(status: Number, parts: Components) -> Map<String, Unknown> {
+    let out = object()
+    out["description"] = http.reason(status)
+    out["content"] = json_content(parts.schema_of(type_ref(http.ErrorBody)))
+    out
+}
+
+## The status a successful call answers with.
+export fn success_status(sig: reflect.Signature) -> Number {
+    let kind = rest.named(sig.returns)
+    if kind == rest.Created { return 201 }
+    if kind == None { return 204 }
+    200
+}
+
+## The OpenAPI operation object for one mounted handler.
+fn operation(op: rest.Operation, parts: Components) -> Map<String, Unknown> {
+    let sig = op.signature
+    let out = object()
+    if op.route.tags.len() > 0 { out["tags"] = op.route.tags }
+    if sig.doc != "" {
+        out["summary"] = summary_of(sig.doc)
+        let more = details_of(sig.doc)
+        if more != "" { out["description"] = more }
+    }
+    out["operationId"] = sig.name
+    let parameters = []
+    let reads_request = false
+    for let i in 0..op.sources.len() {
+        let p = sig.params[i]
+        match op.sources[i] {
+            rest.Source.Path { name: name, type: t } => {
+                reads_request = true
+                let one = object()
+                one["name"] = name
+                one["in"] = "path"
+                one["required"] = true
+                if p.doc != "" { one["description"] = p.doc.trim() }
+                one["schema"] = parts.schema_of(t)
+                parameters.push(one)
+            }
+            rest.Source.Query { name: name, type: t, required: required } => {
+                reads_request = true
+                let one = object()
+                one["name"] = name
+                one["in"] = "query"
+                one["required"] = required
+                if p.doc != "" { one["description"] = p.doc.trim() }
+                let schema = parts.schema_of(t)
+                if schema.has("nullable") { schema.remove("nullable") }
+                if p.default != none { schema["default"] = p.default.unwrap() }
+                one["schema"] = schema
+                parameters.push(one)
+            }
+            rest.Source.Body { type: t } => {
+                reads_request = true
+                let request = object()
+                request["required"] = true
+                if p.doc != "" { request["description"] = p.doc.trim() }
+                request["content"] = json_content(parts.schema_of(t))
+                out["requestBody"] = request
+            }
+            rest.Source.Context { value: _ } => { }
+        }
+    }
+    if parameters.len() > 0 { out["parameters"] = parameters }
+
+    let responses = object()
+    let status = success_status(sig)
+    let ok = object()
+    ok["description"] = http.reason(status)
+    if status != 204 { ok["content"] = json_content(parts.schema_of(sig.returns)) }
+    if status == 201 {
+        let location = object()
+        location["description"] = "where the new resource can be fetched"
+        location["schema"] = typed("string")
+        let headers = object()
+        headers["Location"] = location
+        ok["headers"] = headers
+    }
+    responses["" + status] = ok
+    if reads_request { responses["400"] = error_response(400, parts) }
+    for let code in op.route.errors {
+        responses["" + code] = error_response(code, parts)
+    }
+    out["responses"] = responses
+    out
+}
+
+## The whole OpenAPI 3.0 document for `api`, as Maps and Vectors ready for
+## std:json's `stringify`. Routes that aren't `listed` are left out.
+export fn document(api: rest.Api) -> Map<String, Unknown> {
+    let parts = Components { schemas: [:] }
+    let paths = object()
+    for let op in api.operations {
+        if !op.route.listed { continue }
+        if !paths.has(op.route.path) { paths[op.route.path] = object() }
+        paths[op.route.path][op.route.method.to_lower()] = operation(op, parts)
+    }
+
+    let info = object()
+    info["title"] = api.title
+    info["version"] = api.version
+    if api.description != "" { info["description"] = api.description }
+    let server = object()
+    server["url"] = "/"
+    let tags = []
+    for let pair in api.tags {
+        let tag = object()
+        tag["name"] = pair[0]
+        tag["description"] = pair[1]
+        tags.push(tag)
+    }
+    let components = object()
+    components["schemas"] = parts.schemas
+
+    let out = object()
+    out["openapi"] = "3.0.3"
+    out["info"] = info
+    out["servers"] = [server]
+    if tags.len() > 0 { out["tags"] = tags }
+    out["paths"] = paths
+    out["components"] = components
+    out
+}

@@ -1,9 +1,19 @@
 # The todo list itself, held in memory for as long as the program runs.
 # Nothing is written to disk, so every run starts empty.
 import time from "std:time"
+import rest from "./rest"
 
 ## One todo, exactly as the API hands it out.
-export struct Todo { id: Number, title: String, done: Bool, created_at: String }
+export struct Todo {
+    ## Given by the server, counting up from 1; never reused.
+    @rest.example(1) id: Number,
+    ## What needs doing, trimmed.
+    @rest.example("buy milk") title: String,
+    ## Whether it is finished.
+    @rest.example(false) done: Bool,
+    ## When it was added, in UTC (ISO 8601).
+    @rest.example("2026-10-06T09:30:00Z") created_at: String
+}
 
 ## The todos, oldest first, with the id to give the next one.
 export struct Store { todos: Vector<Todo>, next_id: Number }
@@ -14,15 +24,6 @@ fn index_of(items: Vector<Todo>, id: Number) -> Option<Number> {
         if items[i].id == id { return some(i) }
     }
     none
-}
-
-## `items` without the one at `index` (Vectors have no remove of their own).
-fn without_at(items: Vector<Todo>, index: Number) -> Vector<Todo> {
-    let kept = []
-    for let i in 0..items.len() {
-        if i != index { kept.push(items[i]) }
-    }
-    kept
 }
 
 impl Store {
@@ -83,10 +84,16 @@ impl Store {
 
     ## Drops the todo with `id`; whether it was there to begin with.
     fn remove(self, id: Number) -> Bool {
-        let at = index_of(self.todos, id)
-        if at == none { return false }
-        self.todos = without_at(self.todos, at.unwrap())
+        if !self.has(id) { return false }
+        self.todos = self.todos.filter(fn(todo) { todo.id != id }).reduce()
         true
+    }
+
+    ## Drops every finished todo; how many went.
+    fn remove_done(self) -> Number {
+        let before = self.todos.len()
+        self.todos = self.all(some(false))
+        before - self.todos.len()
     }
 
     ## Forgets every todo (the ids carry on where they left off).

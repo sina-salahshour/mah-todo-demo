@@ -2,7 +2,7 @@
 
 [package]
 name = "mah-simple-todo-app"
-version = "0.1.0"        # your project's own version
+version = "0.2.0"        # your project's own version
 entry = "src/main.mh"    # the file `mah run` executes (relative to this file)
 
 # Build outputs. `mah build` writes every [[target]]; `mah build --target NAME`

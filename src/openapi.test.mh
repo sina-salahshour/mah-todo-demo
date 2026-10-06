@@ -1,0 +1,115 @@
+import "std:test"
+import json from "std:json"
+import api from "./api"
+import "./openapi"
+import store from "./store"
+
+## The document for a fresh todo API, as std:json reads it back, so these
+## tests check what a client would see.
+fn spec() -> Unknown {
+    json.parse(json.stringify(document(api.describe(store.Store.new()))))
+}
+
+test "the document says what it is" {
+    let doc = spec()
+    assert_eq(doc["openapi"], "3.0.3")
+    assert_eq(doc["info"]["title"], "p05 todo api")
+    assert_eq(doc["info"]["version"], api.version)
+    assert_eq(doc["servers"][0]["url"], "/")
+    assert_eq(doc["tags"][0]["name"], "todos")
+}
+
+test "every listed route is there, and the pages are not" {
+    let paths = spec()["paths"]
+    for let p in [
+        "/api",
+        "/health",
+        "/openapi.json",
+        "/todos",
+        "/todos/done",
+        "/todos/{id}",
+        "/todos/{id}/toggle"
+    ] {
+        assert(paths.has(p), p + " should be in the document")
+    }
+    assert(!paths.has("/"))
+    assert(!paths.has("/docs"))
+    let one = paths["/todos/{id}"]
+    for let method in ["get", "put", "patch", "delete"] {
+        assert(one.has(method), method + " /todos/{id} should be in the document")
+    }
+}
+
+test "an operation comes from the function's doc, name and decorators" {
+    let op = spec()["paths"]["/todos/{id}"]["put"]
+    assert_eq(op["operationId"], "replace_todo")
+    assert_eq(op["summary"], "Replace a todo.")
+    assert(op["description"].contains("both come from the body"))
+    assert_eq(op["tags"][0], "todos")
+    assert(op["responses"].has("404"))
+    assert(op["responses"].has("422"))
+    assert(op["responses"].has("400"))
+}
+
+test "parameters come from @path and @query, with their docs" {
+    let id = spec()["paths"]["/todos/{id}"]["get"]["parameters"][0]
+    assert_eq(id["name"], "id")
+    assert_eq(id["in"], "path")
+    assert_eq(id["required"], true)
+    assert_eq(id["description"], "The todo's id.")
+    assert_eq(id["schema"]["type"], "number")
+
+    let done = spec()["paths"]["/todos"]["get"]["parameters"][0]
+    assert_eq(done["in"], "query")
+    assert_eq(done["required"], false)
+    assert_eq(done["schema"]["type"], "boolean")
+}
+
+test "a @body is the request body, and the return type the response" {
+    let post = spec()["paths"]["/todos"]["post"]
+    let body = post["requestBody"]["content"]["application/json"]["schema"]
+    assert_eq(body["$ref"], "#/components/schemas/NewTodo")
+    let created = post["responses"]["201"]
+    assert_eq(created["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/Todo")
+    assert(created["headers"].has("Location"))
+    let deleted = spec()["paths"]["/todos/{id}"]["delete"]["responses"]["204"]
+    assert(!deleted.has("content"))
+}
+
+test "struct schemas carry their fields, docs, examples and what is required" {
+    let schemas = spec()["components"]["schemas"]
+    let todo = schemas["Todo"]
+    assert_eq(todo["type"], "object")
+    assert_eq(todo["description"], "One todo, exactly as the API hands it out.")
+    assert_eq(todo["properties"]["title"]["type"], "string")
+    assert_eq(todo["properties"]["title"]["example"], "buy milk")
+    assert_eq(todo["required"].len(), 4)
+
+    let patch = schemas["TodoPatch"]
+    assert(!patch.has("required"))
+    assert_eq(patch["properties"]["done"]["nullable"], true)
+
+    let list = schemas["TodoList"]["properties"]["todos"]
+    assert_eq(list["type"], "array")
+    assert_eq(list["items"]["$ref"], "#/components/schemas/Todo")
+    assert(schemas.has("ErrorBody"))
+}
+
+test "the summary is the first line of a doc, the description the rest" {
+    assert_eq(summary_of("One.\n\nTwo\nthree."), "One.")
+    assert_eq(details_of("One.\n\nTwo\nthree."), "Two\nthree.")
+    assert_eq(details_of("One."), "")
+}
+
+test "a successful call answers 201, 204 or 200 by return type" {
+    let ops = api.describe(store.Store.new()).operations
+    let status = fn(name: String) -> Number {
+        for let op in ops {
+            if op.signature.name == name { return success_status(op.signature) }
+        }
+        0
+    }
+    assert_eq(status("create_todo"), 201)
+    assert_eq(status("delete_todo"), 204)
+    assert_eq(status("get_todo"), 200)
+}

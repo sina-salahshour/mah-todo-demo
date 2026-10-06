@@ -8,8 +8,8 @@
 # written to disk, so every run starts with an empty list.
 import process from "std:process"
 import socket from "std:socket"
-import api from "./api"
 import app from "./app"
+import rest from "./rest"
 import store from "./store"
 
 let config = try { app.config_from_args(process.args()) } catch {
@@ -25,11 +25,17 @@ let server = try { app.start(config, store.Store.new()) } catch {
         print("p05: cannot listen on " + config.host + ":" + config.port + ": " + e.message())
         process.exit(1)
     }
+    e: rest.SetupError => {
+        print("p05: a route is declared wrong: " + e.message())
+        process.exit(1)
+    }
 }
 if server.port() != config.port {
     print("port " + config.port + " was taken, using " + server.port() + " instead")
 }
 print("todo api on " + server.url() + " -- Ctrl-C to stop")
+print("  the list:  " + server.url() + "/")
+print("  API docs:  " + server.url() + "/docs  (Swagger UI over /openapi.json)")
 for let route in server.router.describe() {
     print("  " + route)
 }
