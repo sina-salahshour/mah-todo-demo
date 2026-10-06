@@ -32,8 +32,16 @@ test "the page talks to the json api over fetch" {
 
 test "the page carries no outside script or style" {
     let page = web.page()
-    assert(!page.contains("http://") & !page.contains("https://"))
     assert(!page.contains("<script src="))
+    assert(!page.contains("<link"))
+    assert(!page.contains("@import"))
+    assert(!page.contains("http://"))
+}
+
+test "the page says it is made with mah, and links to it and to its source" {
+    let page = web.page()
+    assert(page.contains("made with <a href='https://github.com/sina-salahshour/mahlang'"))
+    assert(page.contains("href='https://github.com/sina-salahshour/mah-todo-demo'"))
 }
 
 test "the page links to the api docs" {

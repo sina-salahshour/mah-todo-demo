@@ -4,8 +4,15 @@
 #
 # The JavaScript in the todo page talks to the same JSON API any other client
 # would use -- nothing here is special-cased server side, so what you see in
-# the browser is what curl does. It carries no outside script or style; only
-# /docs loads Swagger UI from a CDN.
+# the browser is what curl does. It carries no outside script or style (its
+# only outside links are to Mah and this repository); only /docs loads
+# Swagger UI from a CDN.
+
+## The Mah language, which this program is written in.
+let mahlang = "https://github.com/sina-salahshour/mahlang"
+
+## This program's own source.
+let repo = "https://github.com/sina-salahshour/mah-todo-demo"
 
 ## The Swagger UI release /docs loads.
 let swagger_ui = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14"
@@ -86,7 +93,9 @@ export fn page() -> String {
         ".foot button:disabled { opacity: .4; cursor: default; }",
         "#status { min-height: 1.4em; margin: .8rem .2rem 0; font-size: .85rem; color: var(--bad); }",
         "footer { margin-top: 1.5rem; text-align: center; color: var(--muted); font-size: .8rem; }",
+        "footer p { margin: .3rem 0; }",
         "footer a { color: inherit; }",
+        "footer .made a { color: var(--accent); font-weight: 600; text-decoration: none; }",
         "kbd { font: inherit; border: 1px solid var(--line); border-radius: .3rem; padding: 0 .3rem; }",
         "@media (max-width: 30rem) { header { flex-wrap: wrap; } header nav { margin-left: 0; }",
         "  li .drop { opacity: 1; } }",
@@ -125,8 +134,12 @@ export fn page() -> String {
         "  </div>",
         "</div>",
         "<div id='status' role='status'></div>",
-        "<footer>press <kbd>/</kbd> to add a todo &middot; restarting the server forgets everything &middot;",
-        "  <a href='/api'>/api</a></footer>",
+        "<footer>",
+        "  <p>press <kbd>/</kbd> to add a todo &middot; restarting the server forgets everything &middot;",
+        "    <a href='/api'>/api</a></p>",
+        "  <p class='made'>made with <a href='" + mahlang + "' target='_blank' rel='noreferrer'>Mah</a>",
+        "    &#x263E; &middot; <a href='" + repo + "' target='_blank' rel='noreferrer'>source</a></p>",
+        "</footer>",
         "</main>",
         "<script>",
         "const $ = (id) => document.getElementById(id)",
